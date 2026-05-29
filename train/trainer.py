@@ -8,7 +8,13 @@ import torch
 from torch import Tensor, nn
 
 from models.tmoe_model import TMoELLaVAMicro
-from .loss import TMoELossWeights, total_tmoe_loss
+from .loss import (
+    TMoELossWeights,
+    autoregressive_loss,
+    cfcr_loss,
+    load_balancing_loss,
+    orthogonalization_loss,
+)
 
 
 @dataclass
@@ -44,19 +50,40 @@ class TMoETrainer:
     ) -> dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
+        
+        device = next(self.model.parameters()).device
+        frames = frames.to(device)
+        input_ids = input_ids.to(device)
+        labels = labels.to(device)
+        
         output = self.model(frames, input_ids, reset_cache=True)
-        first_router = output.router_outputs[0]
-        first_block = self.model.blocks[0]
-        losses = total_tmoe_loss(
-            logits=output.logits,
-            labels=labels,
-            router_probs=first_router.probs,
-            motion_confidence=output.motion_confidence,
-            experts=first_block.moe.experts,
-            weights=self.config.loss_weights,
-        )
-        losses["loss"].backward()
+        ar = autoregressive_loss(output.logits, labels)
+
+        aux_losses = []
+        cfcr_losses = []
+        ortho_losses = []
+        for block, router in zip(self.model.blocks, output.router_outputs):
+            aux_losses.append(load_balancing_loss(router.probs))
+            cfcr_losses.append(cfcr_loss(router.probs, output.motion_confidence))
+            ortho_losses.append(orthogonalization_loss(block.moe.experts))
+        if not aux_losses:
+            raise RuntimeError("model must produce at least one router output")
+
+        aux = torch.stack(aux_losses).mean()
+        cfcr = torch.stack(cfcr_losses).mean()
+        ortho = torch.stack(ortho_losses).mean()
+        weights = self.config.loss_weights
+        loss = ar + weights.alpha_aux * aux
+        loss = loss + weights.beta_cfcr * cfcr + weights.gamma_ortho * ortho
+
+        loss.backward()
         if self.config.grad_clip_norm is not None:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
         self.optimizer.step()
-        return {name: value.detach().item() for name, value in losses.items()}
+        return {
+            "loss": loss.detach().item(),
+            "ar": ar.detach().item(),
+            "aux": aux.detach().item(),
+            "cfcr": cfcr.detach().item(),
+            "ortho": ortho.detach().item(),
+        }

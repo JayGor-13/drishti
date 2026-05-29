@@ -29,6 +29,7 @@ class TMoEConfig:
     motion_dim: int = 64
     router_history_window: int = 2
     router_temperature: float = 1.0
+    use_motion_conditioning: bool = True
     cache_threshold: float = 0.05
     lora_rank: int = 0
     lora_alpha: float = 1.0
@@ -100,6 +101,7 @@ class VideoMoEBlock(nn.Module):
             top_k=config.top_k,
             router_history_window=config.router_history_window,
             router_temperature=config.router_temperature,
+            use_motion_conditioning=config.use_motion_conditioning,
             lora_rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
         )

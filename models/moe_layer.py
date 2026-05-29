@@ -114,6 +114,7 @@ class MicroMoELayer(nn.Module):
         top_k: int = 2,
         router_history_window: int = 2,
         router_temperature: float = 1.0,
+        use_motion_conditioning: bool = True,
         lora_rank: int = 0,
         lora_alpha: float = 1.0,
         freeze_base: bool = False,
@@ -129,6 +130,7 @@ class MicroMoELayer(nn.Module):
             top_k=top_k,
             history_window=router_history_window,
             temperature=router_temperature,
+            use_motion_conditioning=use_motion_conditioning,
         )
         self.experts = nn.ModuleList(
             [
@@ -229,10 +231,38 @@ class MicroMoELayer(nn.Module):
 
             if compute_mask.any():
                 frame_router = self._slice_router(router, frame_idx)
-                flat_branch = self._run_experts(
-                    frame_tokens.reshape(batch * slots, hidden),
-                    frame_router,
-                ).reshape(batch, slots, hidden)
+                flat_compute_mask = compute_mask.reshape(-1)
+                flat_frame_tokens = frame_tokens.reshape(batch * slots, hidden)
+                active_tokens = flat_frame_tokens[flat_compute_mask]
+                active_router = RouterOutput(
+                    logits=frame_router.logits.reshape(batch * slots, -1)[
+                        flat_compute_mask
+                    ],
+                    probs=frame_router.probs.reshape(batch * slots, -1)[
+                        flat_compute_mask
+                    ],
+                    topk_indices=frame_router.topk_indices.reshape(batch * slots, -1)[
+                        flat_compute_mask
+                    ],
+                    topk_scores=frame_router.topk_scores.reshape(batch * slots, -1)[
+                        flat_compute_mask
+                    ],
+                    context=frame_router.context.reshape(batch * slots, -1)[
+                        flat_compute_mask
+                    ],
+                    entropy=frame_router.entropy.reshape(batch * slots)[
+                        flat_compute_mask
+                    ],
+                )
+                active_branch = self._run_experts(active_tokens, active_router)
+                flat_branch = torch.zeros(
+                    batch * slots,
+                    hidden,
+                    device=tokens.device,
+                    dtype=tokens.dtype,
+                )
+                flat_branch[flat_compute_mask] = active_branch
+                flat_branch = flat_branch.reshape(batch, slots, hidden)
                 ffn_outputs[:, frame_idx] = torch.where(
                     compute_mask.unsqueeze(-1),
                     flat_branch,

@@ -1,10 +1,12 @@
 import torch
+import pytest
 
 from models.cache import EventTokenCache
 from models.moe_layer import MicroMoELayer
 from models.router import TemporallyAwareRouter
 from models.tmoe_model import TMoEConfig, TMoELLaVAMicro
-from train.loss import cfcr_loss, expert_lora_similarity
+from train.loss import cfcr_loss, expert_lora_similarity, load_balancing_loss
+from train.trainer import TMoETrainer, TrainingConfig
 
 
 def tiny_config() -> TMoEConfig:
@@ -57,6 +59,43 @@ def test_cache_bypasses_static_second_frame():
     assert output.stats.executed_tokens == 4
     assert output.stats.cached_tokens == 4
     assert torch.allclose(output.hidden_states[:, 0], output.hidden_states[:, 1], atol=1e-6)
+
+
+def test_token_level_cache_mixed_motion():
+    torch.manual_seed(5)
+    hidden = 12
+    layer = MicroMoELayer(
+        hidden_dim=hidden,
+        ffn_dim=24,
+        num_experts=3,
+        top_k=1,
+        router_history_window=1,
+    )
+    cache = EventTokenCache(threshold=0.05)
+    frame = torch.randn(1, 1, 4, hidden)
+    tokens = frame.repeat(1, 2, 1, 1)
+    tokens[:, 1, 2:] = tokens[:, 1, 2:] + 0.5
+    motion_confidence = torch.tensor([[[1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]]])
+    expert_token_rows = 0
+
+    def count_expert_rows(_module, inputs, _output):
+        nonlocal expert_token_rows
+        expert_token_rows += inputs[0].shape[0]
+
+    handles = [
+        expert.register_forward_hook(count_expert_rows) for expert in layer.experts
+    ]
+    try:
+        output = layer(tokens, motion_confidence=motion_confidence, cache=cache)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    ffn_branch = output.hidden_states - tokens
+    assert output.stats.executed_tokens == 6
+    assert output.stats.cached_tokens == 2
+    assert expert_token_rows == 6
+    assert torch.allclose(ffn_branch[:, 1, :2], ffn_branch[:, 0, :2], atol=1e-6)
 
 
 def test_router_gradients_flow():
@@ -116,3 +155,33 @@ def test_lm_head_output_shape_and_finiteness():
 
     assert output.next_token_logits.shape == (1, model.config.vocab_size)
     assert torch.isfinite(output.next_token_logits).all()
+
+
+def test_trainer_averages_aux_loss_across_layers():
+    torch.manual_seed(6)
+    config = tiny_config()
+    config.num_layers = 2
+    model = TMoELLaVAMicro(config)
+    with torch.no_grad():
+        first_router = model.blocks[0].moe.router
+        first_router.token_gate.weight.zero_()
+        first_router.context_gate.weight.zero_()
+        if first_router.motion_gate is not None:
+            first_router.motion_gate.weight.zero_()
+
+    trainer = TMoETrainer(
+        model,
+        TrainingConfig(learning_rate=0.0, weight_decay=0.0),
+    )
+    frames = torch.randn(1, 2, 3, 16, 16)
+    input_ids = torch.randint(0, config.vocab_size, (1, 6))
+    labels = input_ids.clone()
+
+    metrics = trainer.train_step(frames, input_ids, labels)
+    with torch.no_grad():
+        output = model(frames, input_ids, reset_cache=True)
+        expected_aux = torch.stack(
+            [load_balancing_loss(router.probs) for router in output.router_outputs]
+        ).mean()
+
+    assert metrics["aux"] == pytest.approx(expected_aux.item(), rel=1e-6)
