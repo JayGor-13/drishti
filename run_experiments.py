@@ -164,7 +164,7 @@ def run_experiment(spec: ExperimentSpec, args: argparse.Namespace) -> dict[str, 
         # Calculate routing diagnostic stats at this step
         model.eval()
         with torch.no_grad():
-            output = model(frames, input_ids, reset_cache=True)
+            output = model(frames.to(device), input_ids.to(device), reset_cache=True)
             entropy = sum(routing_entropy(r.probs).item() for r in output.router_outputs) / len(output.router_outputs)
             similarity = sum(expert_lora_similarity(b.moe.experts).item() for b in model.blocks) / len(model.blocks)
         
@@ -183,7 +183,7 @@ def run_experiment(spec: ExperimentSpec, args: argparse.Namespace) -> dict[str, 
     eval_frames, eval_ids, _ = generate_synthetic_batch(config, args, seed=args.seed + 9999)
     model.eval()
     with torch.no_grad():
-        output = model(eval_frames, eval_ids, reset_cache=True)
+        output = model(eval_frames.to(device), eval_ids.to(device), reset_cache=True)
         total_tokens = sum(stats.total_tokens for stats in output.moe_stats)
         cached_tokens = sum(stats.cached_tokens for stats in output.moe_stats)
         cache_efficiency = 100.0 * cached_tokens / max(total_tokens, 1)
