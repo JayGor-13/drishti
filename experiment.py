@@ -42,7 +42,7 @@ class ExperimentConfig:
     ``smoke=False`` for the full configured run.
     """
 
-    smoke: bool = True
+    smoke: bool = False
     dataset_name: str = "lmms-lab/ActivityNetQA"
     dataset_split: str = "test"
     hf_token_env: str = "HF_TOKEN"
