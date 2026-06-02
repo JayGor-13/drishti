@@ -5,6 +5,12 @@ description = "Research scaffold for T-MoE-LLaVA 2.0 Micro-MoE video-language mo
 requires-python = ">=3.10"
 dependencies = [
     "torch",
+    "datasets",
+    "huggingface_hub",
+    "matplotlib",
+    "numpy",
+    "python-dotenv",
+    "tqdm",
 ]
 
 [tool.pytest.ini_options]

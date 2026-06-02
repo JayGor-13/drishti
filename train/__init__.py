@@ -1,5 +1,13 @@
 """Training utilities for T-MoE-LLaVA Micro-MoE."""
 
+from .activitynetqa import (
+    ActivityNetQACollator,
+    ActivityNetQADataset,
+    ActivityNetQARecord,
+    SimpleQATokenizer,
+    load_activitynetqa_records,
+    split_records,
+)
 from .loss import (
     TMoELossWeights,
     autoregressive_loss,
@@ -13,6 +21,10 @@ from .loss import (
 from .trainer import TMoETrainer, TrainingConfig
 
 __all__ = [
+    "ActivityNetQACollator",
+    "ActivityNetQADataset",
+    "ActivityNetQARecord",
+    "SimpleQATokenizer",
     "TMoELossWeights",
     "TMoETrainer",
     "TrainingConfig",
@@ -22,5 +34,7 @@ __all__ = [
     "load_balancing_loss",
     "orthogonalization_loss",
     "routing_entropy",
+    "load_activitynetqa_records",
+    "split_records",
     "total_tmoe_loss",
 ]
