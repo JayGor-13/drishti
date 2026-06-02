@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - exercised only when optional deps miss
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_'-]+|[^\sA-Za-z0-9_]")
+VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,64 @@ class ActivityNetQARecord:
     question: str
     answer: str
     question_type: str
+
+
+def _video_lookup_keys(value: str) -> set[str]:
+    """Return filename/stem variants that commonly identify one ActivityNet clip."""
+
+    if not value:
+        return set()
+    name = Path(str(value)).name.strip()
+    stem = Path(name).stem.strip()
+    keys = {name.lower(), stem.lower()}
+    if stem.startswith("v_"):
+        keys.add(stem[2:].lower())
+    else:
+        keys.add(f"v_{stem}".lower())
+
+    question_match = re.match(r"^v_(.+)_\d+$", stem)
+    if question_match:
+        video_stem = question_match.group(1)
+        keys.update({video_stem.lower(), f"v_{video_stem}".lower()})
+    return {key for key in keys if key}
+
+
+class VideoFileIndex:
+    """Fast lookup for videos extracted from one or more ActivityNetQA shards."""
+
+    def __init__(self, root: str | Path | None) -> None:
+        self.root = Path(root) if root else None
+        self.paths_by_key: dict[str, Path] = {}
+        if self.root is not None and self.root.exists():
+            self.paths_by_key = self._build_index(self.root)
+
+    def __len__(self) -> int:
+        return len({path for path in self.paths_by_key.values()})
+
+    @staticmethod
+    def _build_index(root: Path) -> dict[str, Path]:
+        index: dict[str, Path] = {}
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
+            for key in _video_lookup_keys(path.name):
+                index.setdefault(key, path)
+        return index
+
+    def find(self, record: ActivityNetQARecord) -> Path | None:
+        candidates = [
+            record.video_name,
+            f"{record.video_name}.mp4" if record.video_name else "",
+            f"v_{record.video_name}.mp4" if record.video_name else "",
+            record.question_id,
+            f"{record.question_id}.mp4" if record.question_id else "",
+        ]
+        for candidate in candidates:
+            for key in _video_lookup_keys(candidate):
+                path = self.paths_by_key.get(key)
+                if path is not None:
+                    return path
+        return None
 
 
 class SimpleQATokenizer:
@@ -174,6 +233,7 @@ class ActivityNetQADataset(Dataset):
         width: int = 32,
         max_text_length: int = 64,
         video_root: str | None = None,
+        allow_proxy_videos: bool = True,
     ) -> None:
         self.records = records
         self.tokenizer = tokenizer
@@ -182,6 +242,8 @@ class ActivityNetQADataset(Dataset):
         self.width = width
         self.max_text_length = max_text_length
         self.video_root = Path(video_root) if video_root else None
+        self.allow_proxy_videos = allow_proxy_videos
+        self.video_index = VideoFileIndex(self.video_root)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -206,40 +268,93 @@ class ActivityNetQADataset(Dataset):
     def _video_path(self, record: ActivityNetQARecord) -> Path | None:
         if self.video_root is None or not record.video_name:
             return None
+        indexed = self.video_index.find(record)
+        if indexed is not None:
+            return indexed
         candidates = [
             self.video_root / record.video_name,
             self.video_root / f"{record.video_name}.mp4",
+            self.video_root / f"v_{record.video_name}.mp4",
         ]
         for candidate in candidates:
             if candidate.exists():
                 return candidate
         return None
 
-    def _load_video_frames(self, record: ActivityNetQARecord) -> torch.Tensor:
-        video_path = self._video_path(record)
-        if video_path is None:
-            return self._proxy_frames(record)
-        try:
-            from torchvision.io import read_video
-        except ImportError:
-            return self._proxy_frames(record)
+    def has_video(self, record: ActivityNetQARecord) -> bool:
+        return self._video_path(record) is not None
 
-        try:
-            frames, _, _ = read_video(str(video_path), pts_unit="sec")
-        except Exception:
-            return self._proxy_frames(record)
+    def _resize_frames(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.numel() == 0:
-            return self._proxy_frames(record)
-
+            raise ValueError("decoded video contained no frames")
+        if frames.shape[0] < self.num_frames:
+            repeat_count = self.num_frames - frames.shape[0]
+            frames = torch.cat([frames, frames[-1:].repeat(repeat_count, 1, 1, 1)], dim=0)
         indices = torch.linspace(0, frames.shape[0] - 1, self.num_frames).long()
         sampled = frames[indices].permute(0, 3, 1, 2).float() / 255.0
-        sampled = torch.nn.functional.interpolate(
+        return torch.nn.functional.interpolate(
             sampled,
             size=(self.height, self.width),
             mode="bilinear",
             align_corners=False,
         )
-        return sampled
+
+    def _load_video_frames_torchvision(self, video_path: Path) -> torch.Tensor:
+        try:
+            from torchvision.io import read_video
+        except ImportError:
+            raise RuntimeError("torchvision is not installed")
+
+        frames, _, _ = read_video(str(video_path), pts_unit="sec")
+        return self._resize_frames(frames)
+
+    def _load_video_frames_cv2(self, video_path: Path) -> torch.Tensor:
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("opencv-python is not installed")
+
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            raise RuntimeError(f"OpenCV could not open {video_path}")
+        try:
+            total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                raise RuntimeError("OpenCV reported zero frames")
+            indices = np.linspace(0, total_frames - 1, self.num_frames).astype(int)
+            sampled = []
+            for index in indices:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    continue
+                sampled.append(frame[:, :, ::-1].copy())
+            if not sampled:
+                raise RuntimeError("OpenCV could not decode sampled frames")
+            frames = torch.from_numpy(np.stack(sampled, axis=0))
+            return self._resize_frames(frames)
+        finally:
+            capture.release()
+
+    def _load_video_frames(self, record: ActivityNetQARecord) -> torch.Tensor:
+        video_path = self._video_path(record)
+        if video_path is None:
+            if self.allow_proxy_videos:
+                return self._proxy_frames(record)
+            raise FileNotFoundError(f"No local video found for {record.video_name}")
+
+        errors = []
+        for loader in (self._load_video_frames_torchvision, self._load_video_frames_cv2):
+            try:
+                return loader(video_path)
+            except Exception as exc:
+                errors.append(f"{loader.__name__}: {exc}")
+
+        if self.allow_proxy_videos:
+            return self._proxy_frames(record)
+        joined = "; ".join(errors)
+        raise RuntimeError(f"Could not decode {video_path}. {joined}")
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         record = self.records[idx]
@@ -305,3 +420,13 @@ def split_records(
         train_len = len(records) - 1
     train_subset, test_subset = random_split(records, [train_len, test_len], generator)
     return list(train_subset), list(test_subset)
+
+
+def filter_records_with_available_videos(
+    records: list[ActivityNetQARecord],
+    video_root: str | Path,
+) -> list[ActivityNetQARecord]:
+    """Keep only QA rows whose video is present in an extracted shard directory."""
+
+    index = VideoFileIndex(video_root)
+    return [record for record in records if index.find(record) is not None]

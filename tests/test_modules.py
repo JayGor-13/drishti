@@ -5,8 +5,14 @@ from models.cache import EventTokenCache
 from models.moe_layer import MicroMoELayer
 from models.router import TemporallyAwareRouter
 from models.tmoe_model import TMoEConfig, TMoELLaVAMicro
+from train import (
+    ActivityNetQARecord,
+    VideoFileIndex,
+    filter_records_with_available_videos,
+)
 from train.loss import cfcr_loss, expert_lora_similarity, load_balancing_loss
 from train.trainer import TMoETrainer, TrainingConfig
+from experiment import parse_video_shards
 
 
 def tiny_config() -> TMoEConfig:
@@ -185,3 +191,24 @@ def test_trainer_averages_aux_loss_across_layers():
         ).mean()
 
     assert metrics["aux"] == pytest.approx(expected_aux.item(), rel=1e-6)
+
+
+def test_video_index_matches_activitynet_filename_variants(tmp_path):
+    nested = tmp_path / "videos"
+    nested.mkdir()
+    (nested / "v_abc-123.mp4").write_bytes(b"not a real video")
+    records = [
+        ActivityNetQARecord("abc-123", "v_abc-123_2", "q", "a", "3"),
+        ActivityNetQARecord("missing", "v_missing_1", "q", "a", "3"),
+    ]
+
+    index = VideoFileIndex(tmp_path)
+    filtered = filter_records_with_available_videos(records, tmp_path)
+
+    assert index.find(records[0]) == nested / "v_abc-123.mp4"
+    assert filtered == [records[0]]
+
+
+def test_parse_video_shards_accepts_ranges_commas_and_spaces():
+    assert parse_video_shards(["1-3,5", "7 8"], all_shards=False) == (1, 2, 3, 5, 7, 8)
+    assert parse_video_shards(None, all_shards=True) == tuple(range(1, 29))
