@@ -5,9 +5,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
-import shutil
-import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -49,13 +46,9 @@ class ExperimentConfig:
     smoke: bool = False
     dataset_name: str = "lmms-lab/ActivityNetQA"
     dataset_split: str = "test"
+    metadata_file: str | None = None
     hf_token_env: str = "HF_TOKEN"
     video_root: str | None = None
-    video_shards: tuple[int, ...] = ()
-    shard_cache_dir: str = "hf_cache/activitynetqa"
-    shard_extract_dir: str = "hf_cache/activitynetqa/extracted"
-    keep_shard_zip: bool = False
-    cleanup_extracted_shards: bool = False
     require_real_videos: bool = False
     resume_checkpoint: str | None = None
     results_dir: str = "results"
@@ -142,6 +135,7 @@ def prepare_data_records(
     records = load_activitynetqa_records(
         dataset_name=config.dataset_name,
         split=config.dataset_split,
+        metadata_file=config.metadata_file,
         hf_token_env=config.hf_token_env,
         limit_fraction=config.data_fraction,
         seed=config.seed,
@@ -233,90 +227,6 @@ def make_dataloaders(
     return train_loader, test_loader, tokenizer, {**metadata_sizes, **loader_sizes}
 
 
-def parse_video_shards(values: list[str] | None, all_shards: bool) -> tuple[int, ...]:
-    """Parse CLI shard selections like ``1 2 3`` or ``1-4,7``."""
-
-    if all_shards:
-        return tuple(range(1, 29))
-    if not values:
-        return ()
-    shards: set[int] = set()
-    for value in values:
-        for part in value.replace(",", " ").split():
-            if "-" in part:
-                start_text, end_text = part.split("-", 1)
-                start = int(start_text)
-                end = int(end_text)
-                if start > end:
-                    raise ValueError(f"Invalid shard range: {part}")
-                shards.update(range(start, end + 1))
-            else:
-                shards.add(int(part))
-    invalid = [shard for shard in shards if shard < 1 or shard > 28]
-    if invalid:
-        raise ValueError(f"ActivityNetQA shard ids must be in 1..28, got {invalid}")
-    return tuple(sorted(shards))
-
-
-def load_hf_token(config: ExperimentConfig) -> str | None:
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        pass
-    else:
-        load_dotenv()
-    return os.getenv(config.hf_token_env) or os.getenv("HUGGINGFACE_HUB_TOKEN")
-
-
-def download_video_shard(config: ExperimentConfig, shard_id: int) -> Path:
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as exc:
-        raise ImportError("Install huggingface_hub before downloading video shards.") from exc
-
-    filename = f"videos_chunked_{shard_id:02d}.zip"
-    cache_dir = Path(config.shard_cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return Path(
-        hf_hub_download(
-            repo_id=config.dataset_name,
-            repo_type="dataset",
-            filename=filename,
-            token=load_hf_token(config),
-            local_dir=str(cache_dir),
-        )
-    )
-
-
-def safe_extract_zip(zip_path: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    destination_root = destination.resolve()
-    with zipfile.ZipFile(zip_path) as archive:
-        for member in archive.infolist():
-            target = (destination / member.filename).resolve()
-            if destination_root not in [target, *target.parents]:
-                raise RuntimeError(f"Refusing to extract unsafe zip member: {member.filename}")
-        archive.extractall(destination)
-
-
-def prepare_video_shard(config: ExperimentConfig, shard_id: int) -> Path:
-    shard_name = f"videos_chunked_{shard_id:02d}"
-    shard_dir = Path(config.shard_extract_dir) / shard_name
-    marker = shard_dir / ".extracted"
-    if marker.exists():
-        return shard_dir
-
-    zip_path = download_video_shard(config, shard_id)
-    safe_extract_zip(zip_path, shard_dir)
-    marker.write_text(zip_path.name, encoding="utf-8")
-    if not config.keep_shard_zip:
-        try:
-            zip_path.unlink()
-        except OSError:
-            pass
-    return shard_dir
-
-
 def compute_losses(
     model: TMoELLaVAMicro,
     output: Any,
@@ -392,7 +302,6 @@ def train_model(
     optimizer: torch.optim.Optimizer | None = None,
     tokenizer: SimpleQATokenizer | None = None,
     results_dir: Path | None = None,
-    shard_id: int | None = None,
     global_epoch_offset: int = 0,
 ) -> tuple[list[dict[str, float]], dict[str, Any]]:
     weights = TMoELossWeights(
@@ -431,8 +340,6 @@ def train_model(
                 "routing_entropy": diag["routing_entropy"],
                 "expert_similarity": diag["expert_similarity"],
             }
-            if shard_id is not None:
-                row["shard"] = float(shard_id)
             history.append(row)
             progress.set_postfix(loss=f"{metrics['loss']:.3f}", cache=f"{diag['cache_efficiency']:.1f}%")
 
@@ -445,7 +352,6 @@ def train_model(
                 tokenizer=tokenizer,
                 epoch=epoch + 1,
                 global_epoch=global_epoch_offset + epoch + 1,
-                shard_id=shard_id,
             )
 
     return history, last_diag
@@ -645,17 +551,13 @@ def save_checkpoint(
     tokenizer: SimpleQATokenizer | None = None,
     epoch: int | None = None,
     global_epoch: int | None = None,
-    shard_id: int | None = None,
     name: str | None = None,
 ) -> Path:
     checkpoint_dir = results_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     if name is None:
-        if shard_id is None:
-            checkpoint_epoch = global_epoch if global_epoch is not None else epoch
-            name = f"epoch_{checkpoint_epoch:03d}.pt" if checkpoint_epoch is not None else "tmoe_micro.pt"
-        else:
-            name = f"shard_{shard_id:02d}_epoch_{epoch:03d}.pt"
+        checkpoint_epoch = global_epoch if global_epoch is not None else epoch
+        name = f"epoch_{checkpoint_epoch:03d}.pt" if checkpoint_epoch is not None else "tmoe_micro.pt"
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "model_config": asdict(model.config),
@@ -664,7 +566,6 @@ def save_checkpoint(
         "tokenizer_vocab": tokenizer.vocab if tokenizer is not None else None,
         "epoch": epoch,
         "global_epoch": global_epoch,
-        "shard_id": shard_id,
     }
     path = checkpoint_dir / name
     torch.save(checkpoint, path)
@@ -689,136 +590,6 @@ def load_checkpoint_if_requested(
     return checkpoint
 
 
-def default_eval_summary() -> dict[str, float]:
-    return {
-        "eval_ar_loss": 0.0,
-        "token_accuracy": 0.0,
-        "exact_match": 0.0,
-        "cache_efficiency": 0.0,
-        "routing_entropy": 0.0,
-        "expert_similarity": 0.0,
-    }
-
-
-def run_sharded_experiment(
-    config: ExperimentConfig,
-    device: torch.device,
-    results_dir: Path,
-) -> None:
-    train_records, test_records, tokenizer, metadata_sizes = prepare_data_records(config)
-    model = TMoELLaVAMicro(build_model_config(config, tokenizer.vocab_size)).to(device)
-    optimizer = build_optimizer(model, config)
-    checkpoint = load_checkpoint_if_requested(model, optimizer, config, device)
-    global_epoch_offset = int((checkpoint or {}).get("global_epoch") or 0)
-
-    all_history: list[dict[str, float]] = []
-    shard_sizes: list[dict[str, Any]] = []
-    train_diag: dict[str, Any] = {}
-    eval_diag: dict[str, Any] = {}
-    eval_summary: dict[str, float] = default_eval_summary()
-    samples: list[dict[str, Any]] = []
-
-    for shard_id in config.video_shards:
-        print(f"Preparing ActivityNetQA video shard {shard_id:02d}...")
-        shard_root = prepare_video_shard(config, shard_id)
-        try:
-            train_loader, test_loader, sizes = make_dataloaders_from_records(
-                config,
-                train_records,
-                test_records,
-                tokenizer,
-                video_root=shard_root,
-                require_real_videos=True,
-            )
-        except RuntimeError as exc:
-            print(f"Skipping shard {shard_id:02d}: {exc}")
-            if config.cleanup_extracted_shards:
-                shutil.rmtree(shard_root, ignore_errors=True)
-            continue
-
-        sizes = {**sizes, "shard": shard_id, "video_root": str(shard_root)}
-        shard_sizes.append(sizes)
-        print(
-            f"Training shard {shard_id:02d}: "
-            f"train={sizes['train']} test={sizes['test']} epochs={config.epochs}"
-        )
-        history, train_diag = train_model(
-            model,
-            train_loader,
-            config,
-            device,
-            optimizer=optimizer,
-            tokenizer=tokenizer,
-            results_dir=results_dir,
-            shard_id=shard_id,
-            global_epoch_offset=global_epoch_offset,
-        )
-        global_epoch_offset += config.epochs
-        all_history.extend(history)
-        save_checkpoint(
-            model,
-            results_dir,
-            optimizer=optimizer,
-            config=config,
-            tokenizer=tokenizer,
-            epoch=config.epochs,
-            global_epoch=global_epoch_offset,
-            shard_id=shard_id,
-            name=f"after_shard_{shard_id:02d}.pt",
-        )
-
-        if len(test_loader.dataset) > 0:
-            eval_summary, samples, eval_diag = evaluate_model(
-                model,
-                test_loader,
-                tokenizer,
-                config,
-                device,
-            )
-
-        if config.cleanup_extracted_shards:
-            shutil.rmtree(shard_root, ignore_errors=True)
-
-    if not all_history:
-        raise RuntimeError("No shard produced trainable examples. Check the shard ids and video filenames.")
-
-    write_history_csv(all_history, results_dir / "train_history.csv")
-    (results_dir / "config.json").write_text(
-        json.dumps(
-            {
-                **asdict(config),
-                "dataset_sizes": metadata_sizes,
-                "shard_sizes": shard_sizes,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    (results_dir / "eval_summary.json").write_text(
-        json.dumps(eval_summary, indent=2),
-        encoding="utf-8",
-    )
-    (results_dir / "sample_predictions.json").write_text(
-        json.dumps(samples, indent=2),
-        encoding="utf-8",
-    )
-    generate_visualizations(all_history, eval_summary, train_diag, eval_diag, results_dir)
-    save_checkpoint(
-        model,
-        results_dir,
-        optimizer=optimizer,
-        config=config,
-        tokenizer=tokenizer,
-        epoch=config.epochs,
-        global_epoch=global_epoch_offset,
-        name="tmoe_micro_final.pt",
-    )
-
-    print("Sharded experiment complete.")
-    print(f"Results written to: {results_dir.resolve()}")
-    print(json.dumps(eval_summary, indent=2))
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke", dest="smoke", action="store_true", help="Run 1 epoch on 5%% of ActivityNetQA")
@@ -827,30 +598,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", type=str, default=DEFAULT_CONFIG.results_dir)
     parser.add_argument("--dataset-name", type=str, default=DEFAULT_CONFIG.dataset_name)
     parser.add_argument("--dataset-split", type=str, default=DEFAULT_CONFIG.dataset_split)
+    parser.add_argument(
+        "--metadata-file",
+        type=str,
+        default=DEFAULT_CONFIG.metadata_file,
+        help="Local ActivityNetQA metadata parquet file. If omitted, metadata is loaded from --dataset-name.",
+    )
     parser.add_argument("--video-root", type=str, default=DEFAULT_CONFIG.video_root)
     parser.add_argument(
         "--require-real-videos",
         action="store_true",
         help="Fail instead of using proxy frames when --video-root clips are missing or unreadable",
-    )
-    parser.add_argument(
-        "--video-shards",
-        nargs="*",
-        default=None,
-        help="Download/extract/train ActivityNetQA video shards, e.g. --video-shards 1 2 3 or 1-4,7",
-    )
-    parser.add_argument(
-        "--all-video-shards",
-        action="store_true",
-        help="Train through all ActivityNetQA video shards, 1 through 28",
-    )
-    parser.add_argument("--shard-cache-dir", type=str, default=DEFAULT_CONFIG.shard_cache_dir)
-    parser.add_argument("--shard-extract-dir", type=str, default=DEFAULT_CONFIG.shard_extract_dir)
-    parser.add_argument("--keep-shard-zip", action="store_true")
-    parser.add_argument(
-        "--cleanup-extracted-shards",
-        action="store_true",
-        help="Delete each extracted shard folder after it finishes training",
     )
     parser.add_argument("--resume-checkpoint", type=str, default=DEFAULT_CONFIG.resume_checkpoint)
     parser.add_argument("--epochs", type=int, default=None, help="Override smoke/full epoch count")
@@ -865,12 +623,8 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         results_dir=args.results_dir,
         dataset_name=args.dataset_name,
         dataset_split=args.dataset_split,
+        metadata_file=args.metadata_file,
         video_root=args.video_root,
-        video_shards=parse_video_shards(args.video_shards, args.all_video_shards),
-        shard_cache_dir=args.shard_cache_dir,
-        shard_extract_dir=args.shard_extract_dir,
-        keep_shard_zip=args.keep_shard_zip,
-        cleanup_extracted_shards=args.cleanup_extracted_shards,
         require_real_videos=args.require_real_videos,
         resume_checkpoint=args.resume_checkpoint,
         batch_size=args.batch_size,
@@ -896,10 +650,6 @@ def main() -> None:
         f"mode={'smoke' if config.smoke else 'full'} "
         f"epochs={config.epochs} data_fraction={config.data_fraction:.2f}"
     )
-    if config.video_shards:
-        print(f"Video shard mode enabled: {list(config.video_shards)}")
-        run_sharded_experiment(config, device, results_dir)
-        return
 
     train_loader, test_loader, tokenizer, sizes = make_dataloaders(config)
     model = TMoELLaVAMicro(build_model_config(config, tokenizer.vocab_size)).to(device)

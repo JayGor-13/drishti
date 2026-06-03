@@ -174,11 +174,12 @@ def _load_dotenv_if_available() -> None:
 def load_activitynetqa_records(
     dataset_name: str = "lmms-lab/ActivityNetQA",
     split: str = "test",
+    metadata_file: str | None = None,
     hf_token_env: str = "HF_TOKEN",
     limit_fraction: float | None = None,
     seed: int = 42,
 ) -> list[ActivityNetQARecord]:
-    """Load and normalize ActivityNetQA rows from Hugging Face."""
+    """Load and normalize ActivityNetQA rows from a local file or Hugging Face."""
 
     if load_dataset is None:
         raise ImportError(
@@ -186,9 +187,30 @@ def load_activitynetqa_records(
             "huggingface_hub, python-dotenv."
         )
 
-    _load_dotenv_if_available()
-    token = os.getenv(hf_token_env) or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    dataset = load_dataset(dataset_name, split=split, token=token)
+    source_label = f"{dataset_name}:{split}"
+    if metadata_file is not None:
+        metadata_path = Path(metadata_file)
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata file does not exist: {metadata_path}")
+        loaders_by_suffix = {
+            ".parquet": "parquet",
+            ".csv": "csv",
+            ".json": "json",
+            ".jsonl": "json",
+        }
+        loader_name = loaders_by_suffix.get(metadata_path.suffix.lower())
+        if loader_name is None:
+            raise ValueError(
+                "metadata_file must be .parquet, .csv, .json, or .jsonl; "
+                f"got {metadata_path.suffix}"
+            )
+        dataset = load_dataset(loader_name, data_files=str(metadata_path), split="train")
+        source_label = str(metadata_path)
+    else:
+        _load_dotenv_if_available()
+        token = os.getenv(hf_token_env) or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        dataset = load_dataset(dataset_name, split=split, token=token)
+
     if limit_fraction is not None and 0.0 < limit_fraction < 1.0:
         count = max(1, math.ceil(len(dataset) * limit_fraction))
         dataset = dataset.shuffle(seed=seed).select(range(count))
@@ -211,17 +233,16 @@ def load_activitynetqa_records(
                 )
             )
     if not records:
-        raise RuntimeError(f"No usable rows found in {dataset_name}:{split}")
+        raise RuntimeError(f"No usable rows found in {source_label}")
     return records
 
 
 class ActivityNetQADataset(Dataset):
     """ActivityNetQA text rows plus deterministic video tensors.
 
-    The public ActivityNetQA table on Hugging Face exposes QA metadata. This
-    dataset keeps that source of truth and creates deterministic proxy video
-    tensors from the video/question identifiers so the T-MoE video path, motion
-    encoder, cache, router, and language loss are all exercised end to end.
+    The QA metadata can come from a local parquet file or Hugging Face. When
+    local clips are available, this dataset decodes sampled video frames. Proxy
+    tensors are kept only for smoke tests and debugging without video files.
     """
 
     def __init__(
@@ -426,7 +447,7 @@ def filter_records_with_available_videos(
     records: list[ActivityNetQARecord],
     video_root: str | Path,
 ) -> list[ActivityNetQARecord]:
-    """Keep only QA rows whose video is present in an extracted shard directory."""
+    """Keep only QA rows whose video is present in a local video chunk directory."""
 
     index = VideoFileIndex(video_root)
     return [record for record in records if index.find(record) is not None]

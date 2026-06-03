@@ -9,10 +9,10 @@ from train import (
     ActivityNetQARecord,
     VideoFileIndex,
     filter_records_with_available_videos,
+    load_activitynetqa_records,
 )
 from train.loss import cfcr_loss, expert_lora_similarity, load_balancing_loss
 from train.trainer import TMoETrainer, TrainingConfig
-from experiment import parse_video_shards
 
 
 def tiny_config() -> TMoEConfig:
@@ -209,6 +209,16 @@ def test_video_index_matches_activitynet_filename_variants(tmp_path):
     assert filtered == [records[0]]
 
 
-def test_parse_video_shards_accepts_ranges_commas_and_spaces():
-    assert parse_video_shards(["1-3,5", "7 8"], all_shards=False) == (1, 2, 3, 5, 7, 8)
-    assert parse_video_shards(None, all_shards=True) == tuple(range(1, 29))
+def test_load_activitynetqa_records_from_local_metadata_file(tmp_path):
+    metadata = tmp_path / "activitynetqa.csv"
+    metadata.write_text(
+        "video_name,question_id,question,answer,type\n"
+        "abc-123,q1,What happens?,A person jumps,motion\n",
+        encoding="utf-8",
+    )
+
+    records = load_activitynetqa_records(metadata_file=str(metadata))
+
+    assert records == [
+        ActivityNetQARecord("abc-123", "q1", "What happens?", "A person jumps", "motion")
+    ]

@@ -46,55 +46,58 @@ Bash is also kept for future use:
 
 All outputs are written to `results/`.
 
-## Training On ActivityNetQA Video Shards
+## Training From Local Metadata And Video Chunks
 
-The Hugging Face dataset keeps the QA metadata separate from the large video
-archives. The runner loads the small parquet QA table once, then can download
-and extract only the video zip shards you ask for.
+For Colab/Kaggle, keep your ActivityNetQA metadata parquet and extracted video
+chunk folders in Drive or notebook storage. The runner reads the metadata file,
+scans the `--video-root` folder recursively, keeps only QA rows whose videos are
+present in that folder, and trains on those examples.
 
-Train on one shard:
-
-```bash
-python experiment.py --full --video-shards 1 --epochs 1 --batch-size 2 --device cuda
-```
-
-Train on several shards one after another:
-
-```bash
-python experiment.py --full --video-shards 1-3 --epochs 1 --batch-size 2 --device cuda
-```
-
-Train through all 28 shards while cleaning extracted folders after each shard:
-
-```bash
-python experiment.py --full --all-video-shards --epochs 1 --batch-size 2 --device cuda --cleanup-extracted-shards
-```
-
-By default, shard zips are downloaded into `hf_cache/activitynetqa`, extracted
-under `hf_cache/activitynetqa/extracted`, and the zip is deleted after extraction
-to save disk. Add `--keep-shard-zip` if you have enough storage and want to keep
-the downloaded archives.
-
-Checkpoints are saved after every epoch in `results/checkpoints/`. In shard mode
-you will see files like:
+Example data layout:
 
 ```text
-shard_01_epoch_001.pt
-after_shard_01.pt
+/content/drive/MyDrive/ActivityNetQA/
+  metadata/activitynetqa.parquet
+  videos/videos_chunked_01/all_test/videos_chunked_01/*.mp4
+  videos/videos_chunked_02/all_test/videos_chunked_02/*.mp4
+  results/
+```
+
+Train on one extracted video chunk folder:
+
+```bash
+python experiment.py \
+  --full \
+  --metadata-file /content/drive/MyDrive/ActivityNetQA/metadata/activitynetqa.parquet \
+  --video-root /content/drive/MyDrive/ActivityNetQA/videos/videos_chunked_01 \
+  --require-real-videos \
+  --epochs 1 \
+  --batch-size 2 \
+  --device cuda \
+  --results-dir /content/drive/MyDrive/ActivityNetQA/results
+```
+
+Resume training on the next video chunk folder:
+
+```bash
+python experiment.py \
+  --full \
+  --metadata-file /content/drive/MyDrive/ActivityNetQA/metadata/activitynetqa.parquet \
+  --video-root /content/drive/MyDrive/ActivityNetQA/videos/videos_chunked_02 \
+  --require-real-videos \
+  --epochs 1 \
+  --batch-size 2 \
+  --device cuda \
+  --results-dir /content/drive/MyDrive/ActivityNetQA/results \
+  --resume-checkpoint /content/drive/MyDrive/ActivityNetQA/results/checkpoints/latest.pt
+```
+
+Checkpoints are saved after every epoch in `results/checkpoints/`:
+
+```text
+epoch_001.pt
 latest.pt
 tmoe_micro_final.pt
-```
-
-To resume from the most recent checkpoint:
-
-```bash
-python experiment.py --full --video-shards 2-3 --epochs 1 --batch-size 2 --device cuda --resume-checkpoint results/checkpoints/latest.pt
-```
-
-For local videos you already extracted yourself:
-
-```bash
-python experiment.py --full --video-root /path/to/extracted/videos --require-real-videos --epochs 1 --batch-size 2 --device cuda
 ```
 
 If neither `torchvision` nor OpenCV can decode a clip, real-video runs fail
