@@ -20,6 +20,7 @@ from models import TMoEAntiDroneDetector, TMoEConfig
 from train import (
     AntiUAVDatasetPaths,
     AntiUAVDetectionCollator,
+    AntiUAVRGBTVideoDataset,
     MODELSCOPE_ANTI_UAV_URL,
     ModelScopeAntiUAVCocoDataset,
     SyntheticAntiUAVDataset,
@@ -39,6 +40,10 @@ class ExperimentConfig:
 
     smoke: bool = True
     dataset_url: str = MODELSCOPE_ANTI_UAV_URL
+    data_root: str | None = None
+    train_split: str = "train"
+    val_split: str = "test"
+    modality: str = "infrared"
     train_image_root: str | None = None
     train_ann_file: str | None = None
     val_image_root: str | None = None
@@ -56,8 +61,12 @@ class ExperimentConfig:
     grad_clip_norm: float = 1.0
     num_workers: int = 0
     num_frames: int = 9
+    clip_stride: int = 4
+    frame_stride: int = 1
     frame_height: int = 64
     frame_width: int = 64
+    image_channels: int = 3
+    box_format: str = "xywh"
     hidden_dim: int = 64
     ffn_dim: int = 128
     num_experts: int = 8
@@ -108,6 +117,7 @@ def build_model_config(config: ExperimentConfig) -> TMoEConfig:
         num_layers=config.num_layers,
         num_attention_heads=config.num_heads,
         patch_grid_size=config.patch_grid_size,
+        image_channels=config.image_channels,
         motion_dim=config.motion_dim,
         cache_threshold=config.cache_threshold,
         dense_routing=config.dense_routing,
@@ -127,7 +137,33 @@ def _paths(config: ExperimentConfig) -> tuple[AntiUAVDatasetPaths, AntiUAVDatase
 def make_dataloaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, dict[str, Any]]:
     train_paths, val_paths = _paths(config)
     collator = AntiUAVDetectionCollator(config.patch_grid_size)
-    if train_paths.is_complete and val_paths.is_complete:
+    if config.data_root:
+        train_dataset = AntiUAVRGBTVideoDataset(
+            data_root=config.data_root,
+            split=config.train_split,
+            modality=config.modality,
+            num_frames=config.num_frames,
+            height=config.frame_height,
+            width=config.frame_width,
+            clip_stride=config.clip_stride,
+            frame_stride=config.frame_stride,
+            image_channels=config.image_channels,
+            box_format=config.box_format,
+        )
+        val_dataset = AntiUAVRGBTVideoDataset(
+            data_root=config.data_root,
+            split=config.val_split,
+            modality=config.modality,
+            num_frames=config.num_frames,
+            height=config.frame_height,
+            width=config.frame_width,
+            clip_stride=config.clip_stride,
+            frame_stride=config.frame_stride,
+            image_channels=config.image_channels,
+            box_format=config.box_format,
+        )
+        source = f"antiuav_rgbt_{config.modality}_video"
+    elif train_paths.is_complete and val_paths.is_complete:
         train_dataset = ModelScopeAntiUAVCocoDataset(
             root=str(train_paths.image_root),
             ann_file=str(train_paths.ann_file),
@@ -149,19 +185,22 @@ def make_dataloaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, 
             num_frames=config.num_frames,
             height=config.frame_height,
             width=config.frame_width,
+            image_channels=config.image_channels,
         )
         val_dataset = SyntheticAntiUAVDataset(
             num_samples=config.smoke_val_samples,
             num_frames=config.num_frames,
             height=config.frame_height,
             width=config.frame_width,
+            image_channels=config.image_channels,
         )
         source = "synthetic_smoke"
     else:
         raise ValueError(
-            "Full Anti-UAV training requires --train-image-root, --train-ann-file, "
-            "--val-image-root, and --val-ann-file pointing at COCO-format data from "
-            f"{config.dataset_url}"
+            "Full Anti-UAV training requires either --data-root pointing at the extracted "
+            "Anti-UAV-RGBT folder, or --train-image-root/--train-ann-file/"
+            "--val-image-root/--val-ann-file pointing at COCO-format data from "
+            f"{config.dataset_url}."
         )
 
     train_loader = DataLoader(
@@ -183,6 +222,8 @@ def make_dataloaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, 
     sizes = {
         "dataset_url": config.dataset_url,
         "source": source,
+        "modality": config.modality,
+        "image_channels": config.image_channels,
         "train": len(train_dataset),
         "val": len(val_dataset),
     }
@@ -552,9 +593,18 @@ def load_checkpoint_if_requested(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke", dest="smoke", action="store_true", help="Run a synthetic smoke experiment")
-    parser.add_argument("--full", dest="smoke", action="store_false", help="Run with real COCO paths")
+    parser.add_argument("--full", dest="smoke", action="store_false", help="Run with real Anti-UAV data")
     parser.set_defaults(smoke=DEFAULT_CONFIG.smoke)
     parser.add_argument("--dataset-url", type=str, default=DEFAULT_CONFIG.dataset_url)
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default=DEFAULT_CONFIG.data_root,
+        help="Extracted Anti-UAV-RGBT root, e.g. /content/drive/MyDrive/Anti-UAV-RGBT (Unzipped Files)",
+    )
+    parser.add_argument("--train-split", type=str, default=DEFAULT_CONFIG.train_split)
+    parser.add_argument("--val-split", type=str, default=DEFAULT_CONFIG.val_split)
+    parser.add_argument("--modality", choices=["infrared", "visible"], default=DEFAULT_CONFIG.modality)
     parser.add_argument("--train-image-root", type=str, default=DEFAULT_CONFIG.train_image_root)
     parser.add_argument("--train-ann-file", type=str, default=DEFAULT_CONFIG.train_ann_file)
     parser.add_argument("--val-image-root", type=str, default=DEFAULT_CONFIG.val_image_root)
@@ -565,8 +615,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None, help="Override smoke/full epoch count")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG.batch_size)
     parser.add_argument("--num-frames", type=int, default=DEFAULT_CONFIG.num_frames)
+    parser.add_argument("--clip-stride", type=int, default=DEFAULT_CONFIG.clip_stride)
+    parser.add_argument("--frame-stride", type=int, default=DEFAULT_CONFIG.frame_stride)
     parser.add_argument("--height", type=int, default=DEFAULT_CONFIG.frame_height)
     parser.add_argument("--width", type=int, default=DEFAULT_CONFIG.frame_width)
+    parser.add_argument("--image-channels", type=int, choices=[1, 3], default=None)
+    parser.add_argument(
+        "--ir-repeat-rgb",
+        action="store_true",
+        help="Repeat IR grayscale frames to 3 channels instead of training a 1-channel stem",
+    )
+    parser.add_argument("--box-format", choices=["xywh", "xyxy"], default=DEFAULT_CONFIG.box_format)
     parser.add_argument("--patch-grid-size", type=int, default=DEFAULT_CONFIG.patch_grid_size)
     parser.add_argument("--hidden-dim", type=int, default=DEFAULT_CONFIG.hidden_dim)
     parser.add_argument("--ffn-dim", type=int, default=DEFAULT_CONFIG.ffn_dim)
@@ -575,9 +634,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
+    image_channels = args.image_channels
+    if args.ir_repeat_rgb:
+        image_channels = 3
+    elif image_channels is None:
+        image_channels = 1 if args.data_root and args.modality == "infrared" else DEFAULT_CONFIG.image_channels
+
     config = ExperimentConfig(
         smoke=args.smoke,
         dataset_url=args.dataset_url,
+        data_root=args.data_root,
+        train_split=args.train_split,
+        val_split=args.val_split,
+        modality=args.modality,
         train_image_root=args.train_image_root,
         train_ann_file=args.train_ann_file,
         val_image_root=args.val_image_root,
@@ -586,8 +655,12 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         stage=args.stage,
         batch_size=args.batch_size,
         num_frames=args.num_frames,
+        clip_stride=args.clip_stride,
+        frame_stride=args.frame_stride,
         frame_height=args.height,
         frame_width=args.width,
+        image_channels=image_channels,
+        box_format=args.box_format,
         patch_grid_size=args.patch_grid_size,
         hidden_dim=args.hidden_dim,
         ffn_dim=args.ffn_dim,
@@ -612,7 +685,8 @@ def main() -> None:
         "Running T-MoE Anti-UAV detector "
         f"mode={'smoke' if config.smoke else 'full'} "
         f"stage={config.stage} epochs={config.epochs} "
-        f"dataset={config.dataset_url}"
+        f"source={config.data_root or config.dataset_url} "
+        f"modality={config.modality} channels={config.image_channels}"
     )
 
     train_loader, val_loader, sizes = make_dataloaders(config)

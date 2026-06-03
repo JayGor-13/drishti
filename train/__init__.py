@@ -3,6 +3,7 @@
 from .antiuav import (
     AntiUAVDatasetPaths,
     AntiUAVDetectionCollator,
+    AntiUAVRGBTVideoDataset,
     MODELSCOPE_ANTI_UAV_URL,
     ModelScopeAntiUAVCocoDataset,
     SyntheticAntiUAVDataset,
@@ -25,6 +26,7 @@ from .trainer import TMoETrainer, TrainingConfig
 __all__ = [
     "AntiUAVDatasetPaths",
     "AntiUAVDetectionCollator",
+    "AntiUAVRGBTVideoDataset",
     "MODELSCOPE_ANTI_UAV_URL",
     "ModelScopeAntiUAVCocoDataset",
     "SyntheticAntiUAVDataset",

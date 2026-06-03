@@ -21,6 +21,8 @@ https://modelscope.cn/datasets/ly261666/3rd_Anti-UAV
 - Event-based temporal token cache with the architecture threshold default `0.15`.
 - CFCR loss with cosine semantic alignment between adjacent frames.
 - Patch-wise drone/no-drone logits and normalized `cx, cy, w, h` box regression.
+- Anti-UAV-RGBT video loader for extracted `train/<sequence>/infrared.mp4`
+  and `infrared.json` folders.
 - COCO-format Anti-UAV loader using `torchvision.datasets.CocoDetection`.
 - Synthetic smoke dataset for quick CPU verification without downloading data.
 
@@ -33,6 +35,43 @@ python -m pytest -q
 
 The default smoke run trains one epoch on synthetic moving drone boxes and
 writes outputs to `results/`.
+
+## Training IR Videos From Google Drive
+
+After mounting Drive in Colab, point `--data-root` at the extracted folder:
+
+```bash
+python experiment.py \
+  --full \
+  --data-root "/content/drive/MyDrive/Anti-UAV-RGBT (Unzipped Files)" \
+  --train-split train \
+  --val-split test \
+  --modality infrared \
+  --stage sparse \
+  --height 448 \
+  --width 448 \
+  --patch-grid-size 28 \
+  --num-frames 9 \
+  --clip-stride 4 \
+  --frame-stride 1 \
+  --hidden-dim 1024 \
+  --ffn-dim 4096 \
+  --batch-size 2 \
+  --device cuda
+```
+
+For IR, the runner defaults to one input channel and reads:
+
+```text
+Anti-UAV-RGBT (Unzipped Files)/
+  train/<sequence>/infrared.mp4
+  train/<sequence>/infrared.json
+  test/<sequence>/infrared.mp4
+```
+
+If test annotations are stored separately, the loader also checks common
+`label_new` locations such as `label_new/<sequence>/infrared.json` and
+`label_new/test/<sequence>/infrared.json`.
 
 ## Training With The ModelScope Anti-UAV Data
 
