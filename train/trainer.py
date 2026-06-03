@@ -1,19 +1,21 @@
-"""Small trainer wrapper for smoke training and future expansion."""
+"""Small trainer wrapper for Anti-UAV smoke training."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 
-from models.tmoe_model import TMoELLaVAMicro
+from models.tmoe_model import TMoEAntiDroneDetector
 from .loss import (
     TMoELossWeights,
-    autoregressive_loss,
     cfcr_loss,
+    detection_loss,
     load_balancing_loss,
     orthogonalization_loss,
+    semantic_alignment,
 )
 
 
@@ -22,15 +24,16 @@ class TrainingConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
+    cfcr_warmup_steps: int = 500
     loss_weights: TMoELossWeights = field(default_factory=TMoELossWeights)
 
 
 class TMoETrainer:
-    """Minimal trainer that keeps the research loss wired end-to-end."""
+    """Minimal Anti-UAV trainer that keeps all proposal losses wired."""
 
     def __init__(
         self,
-        model: TMoELLaVAMicro,
+        model: TMoEAntiDroneDetector,
         config: TrainingConfig | None = None,
         optimizer: torch.optim.Optimizer | None = None,
     ) -> None:
@@ -41,49 +44,60 @@ class TMoETrainer:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
+        self.global_step = 0
 
-    def train_step(
-        self,
-        frames: Tensor,
-        input_ids: Tensor,
-        labels: Tensor,
-    ) -> dict[str, float]:
+    def beta_cfcr(self) -> float:
+        if self.config.cfcr_warmup_steps <= 0:
+            return self.config.loss_weights.beta_cfcr
+        scale = min(self.global_step / self.config.cfcr_warmup_steps, 1.0)
+        return self.config.loss_weights.beta_cfcr * scale
+
+    def train_step(self, batch: dict[str, Any]) -> dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        
+
         device = next(self.model.parameters()).device
-        frames = frames.to(device)
-        input_ids = input_ids.to(device)
-        labels = labels.to(device)
-        
-        output = self.model(frames, input_ids, reset_cache=True)
-        ar = autoregressive_loss(output.logits, labels)
+        frames = batch["frames"].to(device)
+        class_targets = batch["class_targets"].to(device)
+        box_targets = batch["box_targets"].to(device)
+        box_mask = batch["box_mask"].to(device)
 
-        aux_losses = []
-        cfcr_losses = []
-        ortho_losses = []
-        for block, router in zip(self.model.blocks, output.router_outputs):
-            aux_losses.append(load_balancing_loss(router.probs))
-            cfcr_losses.append(cfcr_loss(router.probs, output.motion_confidence))
-            ortho_losses.append(orthogonalization_loss(block.moe.experts))
-        if not aux_losses:
-            raise RuntimeError("model must produce at least one router output")
-
-        aux = torch.stack(aux_losses).mean()
-        cfcr = torch.stack(cfcr_losses).mean()
-        ortho = torch.stack(ortho_losses).mean()
+        output = self.model(frames, reset_cache=True)
+        det_parts = detection_loss(
+            output.class_logits,
+            output.boxes,
+            class_targets,
+            box_targets,
+            box_mask,
+            weights=self.config.loss_weights,
+        )
+        alignment = semantic_alignment(output.semantic_tokens)
+        aux = torch.stack([load_balancing_loss(router.probs) for router in output.router_outputs]).mean()
+        cfcr = torch.stack(
+            [cfcr_loss(router.probs, output.motion_confidence, alignment) for router in output.router_outputs]
+        ).mean()
+        ortho = torch.stack(
+            [orthogonalization_loss(block.moe.experts) for block in self.model.blocks]
+        ).mean()
+        beta = self.beta_cfcr()
         weights = self.config.loss_weights
-        loss = ar + weights.alpha_aux * aux
-        loss = loss + weights.beta_cfcr * cfcr + weights.gamma_ortho * ortho
+        loss = det_parts["det"] + weights.alpha_aux * aux + beta * cfcr
+        loss = loss + weights.gamma_ortho * ortho
 
         loss.backward()
         if self.config.grad_clip_norm is not None:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
         self.optimizer.step()
+        self.global_step += 1
+
         return {
-            "loss": loss.detach().item(),
-            "ar": ar.detach().item(),
-            "aux": aux.detach().item(),
-            "cfcr": cfcr.detach().item(),
-            "ortho": ortho.detach().item(),
+            "loss": float(loss.detach().cpu()),
+            "det": float(det_parts["det"].detach().cpu()),
+            "cls": float(det_parts["cls"].detach().cpu()),
+            "box_l1": float(det_parts["box_l1"].detach().cpu()),
+            "giou": float(det_parts["giou"].detach().cpu()),
+            "aux": float(aux.detach().cpu()),
+            "cfcr": float(cfcr.detach().cpu()),
+            "ortho": float(ortho.detach().cpu()),
+            "beta_cfcr": beta,
         }

@@ -1,15 +1,14 @@
 [project]
 name = "temporal-moe-vit"
 version = "0.1.0"
-description = "Research scaffold for T-MoE-LLaVA 2.0 Micro-MoE video-language modeling."
+description = "Research scaffold for sparse motion-conditioned Anti-UAV detection."
 requires-python = ">=3.10"
 dependencies = [
     "torch",
-    "datasets",
-    "huggingface_hub",
+    "torchvision",
+    "pycocotools",
     "matplotlib",
     "numpy",
-    "python-dotenv",
     "tqdm",
 ]
 

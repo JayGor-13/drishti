@@ -1,12 +1,14 @@
 param(
     [switch]$Full,
     [string]$ResultsDir = "results",
-    [int]$BatchSize = 4,
+    [int]$BatchSize = 2,
     [int]$Epochs = 0,
     [string]$Device = "",
-    [string]$MetadataFile = "",
-    [string]$VideoRoot = "",
-    [switch]$RequireRealVideos,
+    [string]$TrainImageRoot = "",
+    [string]$TrainAnnFile = "",
+    [string]$ValImageRoot = "",
+    [string]$ValAnnFile = "",
+    [string]$Stage = "sparse",
     [string]$ResumeCheckpoint = ""
 )
 
@@ -16,23 +18,26 @@ $deviceArgs = @()
 if ($Device -ne "") {
     $deviceArgs = @("--device", $Device)
 }
-$videoArgs = @()
-if ($MetadataFile -ne "") {
-    $videoArgs += @("--metadata-file", $MetadataFile)
+$dataArgs = @()
+if ($TrainImageRoot -ne "") {
+    $dataArgs += @("--train-image-root", $TrainImageRoot)
 }
-if ($VideoRoot -ne "") {
-    $videoArgs += @("--video-root", $VideoRoot)
+if ($TrainAnnFile -ne "") {
+    $dataArgs += @("--train-ann-file", $TrainAnnFile)
+}
+if ($ValImageRoot -ne "") {
+    $dataArgs += @("--val-image-root", $ValImageRoot)
+}
+if ($ValAnnFile -ne "") {
+    $dataArgs += @("--val-ann-file", $ValAnnFile)
 }
 $epochArgs = @()
 if ($Epochs -gt 0) {
     $epochArgs = @("--epochs", $Epochs)
-}
-if ($RequireRealVideos) {
-    $videoArgs += "--require-real-videos"
 }
 $resumeArgs = @()
 if ($ResumeCheckpoint -ne "") {
     $resumeArgs = @("--resume-checkpoint", $ResumeCheckpoint)
 }
 
-python experiment.py $mode --results-dir $ResultsDir --batch-size $BatchSize @epochArgs @deviceArgs @videoArgs @resumeArgs
+python experiment.py $mode --stage $Stage --results-dir $ResultsDir --batch-size $BatchSize @epochArgs @deviceArgs @dataArgs @resumeArgs

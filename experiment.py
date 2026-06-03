@@ -1,4 +1,4 @@
-"""Unified ActivityNetQA experiment runner for T-MoE-LLaVA Micro-MoE."""
+"""Anti-UAV experiment runner for the T-MoE detector."""
 
 from __future__ import annotations
 
@@ -16,86 +16,80 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models import TMoEConfig, TMoELLaVAMicro
+from models import TMoEAntiDroneDetector, TMoEConfig
 from train import (
-    ActivityNetQACollator,
-    ActivityNetQADataset,
-    ActivityNetQARecord,
-    SimpleQATokenizer,
+    AntiUAVDatasetPaths,
+    AntiUAVDetectionCollator,
+    MODELSCOPE_ANTI_UAV_URL,
+    ModelScopeAntiUAVCocoDataset,
+    SyntheticAntiUAVDataset,
     TMoELossWeights,
-    autoregressive_loss,
     cfcr_loss,
+    detection_loss,
     expert_lora_similarity,
-    filter_records_with_available_videos,
-    load_activitynetqa_records,
     load_balancing_loss,
-    orthogonalization_loss,
     routing_entropy,
-    split_records,
+    semantic_alignment,
 )
 
 
 @dataclass
 class ExperimentConfig:
-    """Top-level experiment configuration.
+    """Top-level Anti-UAV experiment configuration."""
 
-    Set ``smoke=True`` to run one complete epoch on 5% of ActivityNetQA. Set
-    ``smoke=False`` for the full configured run.
-    """
-
-    smoke: bool = False
-    dataset_name: str = "lmms-lab/ActivityNetQA"
-    dataset_split: str = "test"
-    metadata_file: str | None = None
-    hf_token_env: str = "HF_TOKEN"
-    video_root: str | None = None
-    require_real_videos: bool = False
-    resume_checkpoint: str | None = None
+    smoke: bool = True
+    dataset_url: str = MODELSCOPE_ANTI_UAV_URL
+    train_image_root: str | None = None
+    train_ann_file: str | None = None
+    val_image_root: str | None = None
+    val_ann_file: str | None = None
     results_dir: str = "results"
     seed: int = 42
-    train_fraction: float = 0.8
-    smoke_data_fraction: float = 0.05
-    full_data_fraction: float = 1.0
+    stage: str = "sparse"
+    smoke_train_samples: int = 16
+    smoke_val_samples: int = 8
     smoke_epochs: int = 1
-    full_epochs: int = 5
-    batch_size: int = 4
-    learning_rate: float = 3e-4
+    full_epochs: int = 15
+    batch_size: int = 2
+    learning_rate: float = 1e-4
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
     num_workers: int = 0
-    num_frames: int = 4
-    frame_height: int = 32
-    frame_width: int = 32
-    max_text_length: int = 64
-    max_vocab_size: int = 4096
+    num_frames: int = 9
+    frame_height: int = 64
+    frame_width: int = 64
     hidden_dim: int = 64
     ffn_dim: int = 128
     num_experts: int = 8
     top_k: int = 2
-    num_layers: int = 2
+    num_layers: int = 1
     num_heads: int = 4
-    patch_grid_size: int = 2
+    patch_grid_size: int = 4
     motion_dim: int = 32
-    router_history_window: int = 2
-    cache_threshold: float = 0.05
-    lora_rank: int = 4
-    lora_alpha: float = 8.0
+    cache_threshold: float = 0.15
     alpha_aux: float = 0.01
     beta_cfcr: float = 0.1
-    gamma_ortho: float = 0.01
+    cfcr_warmup_steps: int = 500
+    lambda_box: float = 5.0
+    lambda_giou: float = 2.0
     eval_batches: int = 25
     checkpoint_every_epoch: bool = True
+    expert_noise_std: float = 0.0
 
     @property
     def epochs(self) -> int:
         return self.smoke_epochs if self.smoke else self.full_epochs
 
     @property
-    def data_fraction(self) -> float:
-        return self.smoke_data_fraction if self.smoke else self.full_data_fraction
+    def dense_routing(self) -> bool:
+        return self.stage == "dense"
+
+    @property
+    def sparse_routing(self) -> bool:
+        return self.stage == "sparse"
 
 
-DEFAULT_CONFIG = ExperimentConfig(smoke=True)
+DEFAULT_CONFIG = ExperimentConfig()
 
 
 def set_seed(seed: int) -> None:
@@ -105,9 +99,8 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_model_config(config: ExperimentConfig, vocab_size: int) -> TMoEConfig:
+def build_model_config(config: ExperimentConfig) -> TMoEConfig:
     return TMoEConfig(
-        vocab_size=vocab_size,
         hidden_dim=config.hidden_dim,
         ffn_dim=config.ffn_dim,
         num_experts=config.num_experts,
@@ -116,78 +109,61 @@ def build_model_config(config: ExperimentConfig, vocab_size: int) -> TMoEConfig:
         num_attention_heads=config.num_heads,
         patch_grid_size=config.patch_grid_size,
         motion_dim=config.motion_dim,
-        router_history_window=config.router_history_window,
         cache_threshold=config.cache_threshold,
-        lora_rank=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        max_text_length=config.max_text_length,
+        dense_routing=config.dense_routing,
+        use_temporal_cache=config.sparse_routing,
+        num_classes=2,
+        max_frames=max(config.num_frames, 9),
     )
 
 
-def prepare_data_records(
-    config: ExperimentConfig,
-) -> tuple[
-    list[ActivityNetQARecord],
-    list[ActivityNetQARecord],
-    SimpleQATokenizer,
-    dict[str, int],
-]:
-    records = load_activitynetqa_records(
-        dataset_name=config.dataset_name,
-        split=config.dataset_split,
-        metadata_file=config.metadata_file,
-        hf_token_env=config.hf_token_env,
-        limit_fraction=config.data_fraction,
-        seed=config.seed,
+def _paths(config: ExperimentConfig) -> tuple[AntiUAVDatasetPaths, AntiUAVDatasetPaths]:
+    return (
+        AntiUAVDatasetPaths(config.train_image_root, config.train_ann_file),
+        AntiUAVDatasetPaths(config.val_image_root, config.val_ann_file),
     )
-    train_records, test_records = split_records(
-        records,
-        train_fraction=config.train_fraction,
-        seed=config.seed,
-    )
-    tokenizer = SimpleQATokenizer.fit(train_records, max_vocab_size=config.max_vocab_size)
-    sizes = {"records": len(records), "train": len(train_records), "test": len(test_records)}
-    return train_records, test_records, tokenizer, sizes
 
 
-def make_dataloaders_from_records(
-    config: ExperimentConfig,
-    train_records: list[ActivityNetQARecord],
-    test_records: list[ActivityNetQARecord],
-    tokenizer: SimpleQATokenizer,
-    video_root: str | Path | None = None,
-    require_real_videos: bool = False,
-) -> tuple[DataLoader, DataLoader, dict[str, int]]:
-    active_video_root = str(video_root) if video_root is not None else config.video_root
-    if require_real_videos:
-        if active_video_root is None:
-            raise ValueError("require_real_videos=True requires a video_root")
-        train_records = filter_records_with_available_videos(train_records, active_video_root)
-        test_records = filter_records_with_available_videos(test_records, active_video_root)
-        if not train_records:
-            raise RuntimeError(f"No training videos found under {active_video_root}")
+def make_dataloaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, dict[str, Any]]:
+    train_paths, val_paths = _paths(config)
+    collator = AntiUAVDetectionCollator(config.patch_grid_size)
+    if train_paths.is_complete and val_paths.is_complete:
+        train_dataset = ModelScopeAntiUAVCocoDataset(
+            root=str(train_paths.image_root),
+            ann_file=str(train_paths.ann_file),
+            num_frames=config.num_frames,
+            height=config.frame_height,
+            width=config.frame_width,
+        )
+        val_dataset = ModelScopeAntiUAVCocoDataset(
+            root=str(val_paths.image_root),
+            ann_file=str(val_paths.ann_file),
+            num_frames=config.num_frames,
+            height=config.frame_height,
+            width=config.frame_width,
+        )
+        source = "modelscope_coco"
+    elif config.smoke:
+        train_dataset = SyntheticAntiUAVDataset(
+            num_samples=config.smoke_train_samples,
+            num_frames=config.num_frames,
+            height=config.frame_height,
+            width=config.frame_width,
+        )
+        val_dataset = SyntheticAntiUAVDataset(
+            num_samples=config.smoke_val_samples,
+            num_frames=config.num_frames,
+            height=config.frame_height,
+            width=config.frame_width,
+        )
+        source = "synthetic_smoke"
+    else:
+        raise ValueError(
+            "Full Anti-UAV training requires --train-image-root, --train-ann-file, "
+            "--val-image-root, and --val-ann-file pointing at COCO-format data from "
+            f"{config.dataset_url}"
+        )
 
-    collator = ActivityNetQACollator(pad_token_id=tokenizer.pad_token_id)
-    train_dataset = ActivityNetQADataset(
-        train_records,
-        tokenizer,
-        num_frames=config.num_frames,
-        height=config.frame_height,
-        width=config.frame_width,
-        max_text_length=config.max_text_length,
-        video_root=active_video_root,
-        allow_proxy_videos=not require_real_videos,
-    )
-    test_dataset = ActivityNetQADataset(
-        test_records,
-        tokenizer,
-        num_frames=config.num_frames,
-        height=config.frame_height,
-        width=config.frame_width,
-        max_text_length=config.max_text_length,
-        video_root=active_video_root,
-        allow_proxy_videos=not require_real_videos,
-    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -196,8 +172,8 @@ def make_dataloaders_from_records(
         num_workers=config.num_workers,
         drop_last=False,
     )
-    test_loader = DataLoader(
-        test_dataset,
+    val_loader = DataLoader(
+        val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collator,
@@ -205,54 +181,73 @@ def make_dataloaders_from_records(
         drop_last=False,
     )
     sizes = {
+        "dataset_url": config.dataset_url,
+        "source": source,
         "train": len(train_dataset),
-        "test": len(test_dataset),
-        "videos_required": int(require_real_videos),
+        "val": len(val_dataset),
     }
-    return train_loader, test_loader, sizes
+    return train_loader, val_loader, sizes
 
 
-def make_dataloaders(
-    config: ExperimentConfig,
-) -> tuple[DataLoader, DataLoader, SimpleQATokenizer, dict[str, int]]:
-    train_records, test_records, tokenizer, metadata_sizes = prepare_data_records(config)
-    train_loader, test_loader, loader_sizes = make_dataloaders_from_records(
-        config,
-        train_records,
-        test_records,
-        tokenizer,
-        video_root=config.video_root,
-        require_real_videos=config.require_real_videos,
+def loss_weights(config: ExperimentConfig) -> TMoELossWeights:
+    return TMoELossWeights(
+        alpha_aux=config.alpha_aux,
+        beta_cfcr=config.beta_cfcr,
+        lambda_box=config.lambda_box,
+        lambda_giou=config.lambda_giou,
     )
-    return train_loader, test_loader, tokenizer, {**metadata_sizes, **loader_sizes}
+
+
+def beta_for_step(config: ExperimentConfig, global_step: int) -> float:
+    if not config.sparse_routing:
+        return 0.0
+    if config.cfcr_warmup_steps <= 0:
+        return config.beta_cfcr
+    return config.beta_cfcr * min(global_step / config.cfcr_warmup_steps, 1.0)
 
 
 def compute_losses(
-    model: TMoELLaVAMicro,
+    model: TMoEAntiDroneDetector,
     output: Any,
-    labels: torch.Tensor,
+    batch: dict[str, Any],
     weights: TMoELossWeights,
+    beta_cfcr: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    ar = autoregressive_loss(output.logits, labels)
+    class_targets = batch["class_targets"].to(output.class_logits.device)
+    box_targets = batch["box_targets"].to(output.boxes.device)
+    box_mask = batch["box_mask"].to(output.boxes.device)
+    det_parts = detection_loss(
+        output.class_logits,
+        output.boxes,
+        class_targets,
+        box_targets,
+        box_mask,
+        weights=weights,
+    )
     aux = torch.stack([load_balancing_loss(router.probs) for router in output.router_outputs]).mean()
+    alignment = semantic_alignment(output.semantic_tokens)
     cfcr = torch.stack(
-        [cfcr_loss(router.probs, output.motion_confidence) for router in output.router_outputs]
+        [cfcr_loss(router.probs, output.motion_confidence, alignment) for router in output.router_outputs]
     ).mean()
     ortho = torch.stack(
-        [orthogonalization_loss(block.moe.experts) for block in model.blocks]
+        [expert_lora_similarity(block.moe.experts) for block in model.blocks]
     ).mean()
-    total = ar + weights.alpha_aux * aux + weights.beta_cfcr * cfcr
+    total = det_parts["det"] + weights.alpha_aux * aux + beta_cfcr * cfcr
     total = total + weights.gamma_ortho * ortho
     return total, {
         "loss": float(total.detach().cpu()),
-        "ar": float(ar.detach().cpu()),
+        "det": float(det_parts["det"].detach().cpu()),
+        "cls": float(det_parts["cls"].detach().cpu()),
+        "box_l1": float(det_parts["box_l1"].detach().cpu()),
+        "giou": float(det_parts["giou"].detach().cpu()),
         "aux": float(aux.detach().cpu()),
         "cfcr": float(cfcr.detach().cpu()),
         "ortho": float(ortho.detach().cpu()),
+        "beta_cfcr": beta_cfcr,
     }
 
 
-def collect_diagnostics(model: TMoELLaVAMicro, output: Any) -> dict[str, Any]:
+def collect_diagnostics(model: TMoEAntiDroneDetector, output: Any, batch: dict[str, Any]) -> dict[str, Any]:
     cache_total = sum(stats.total_tokens for stats in output.moe_stats)
     cache_hit = sum(stats.cached_tokens for stats in output.moe_stats)
     expert_counts = []
@@ -267,6 +262,11 @@ def collect_diagnostics(model: TMoELLaVAMicro, output: Any) -> dict[str, Any]:
         expert_probs.append(router.probs.mean(dim=(0, 1, 2)).detach().cpu().numpy())
         entropy.append(float(routing_entropy(router.probs).detach().cpu()))
 
+    predictions = output.class_logits.argmax(dim=-1).detach().cpu()
+    targets = batch["class_targets"].detach().cpu()
+    positives = targets == 1
+    predicted_positives = predictions == 1
+    true_positives = (predicted_positives & positives).sum().item()
     return {
         "cache_efficiency": 100.0 * cache_hit / max(cache_total, 1),
         "cached_tokens": cache_hit,
@@ -276,6 +276,9 @@ def collect_diagnostics(model: TMoELLaVAMicro, output: Any) -> dict[str, Any]:
         "expert_similarity": float(
             np.mean([expert_lora_similarity(block.moe.experts).item() for block in model.blocks])
         ),
+        "patch_accuracy": float((predictions == targets).float().mean().item()),
+        "positive_recall": float(true_positives / max(positives.sum().item(), 1)),
+        "positive_precision": float(true_positives / max(predicted_positives.sum().item(), 1)),
         "expert_counts": np.stack(expert_counts),
         "expert_probs": np.stack(expert_probs),
         "motion_confidence": output.motion_confidence.detach().cpu().numpy(),
@@ -284,7 +287,7 @@ def collect_diagnostics(model: TMoELLaVAMicro, output: Any) -> dict[str, Any]:
 
 
 def build_optimizer(
-    model: TMoELLaVAMicro,
+    model: TMoEAntiDroneDetector,
     config: ExperimentConfig,
 ) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
@@ -295,41 +298,36 @@ def build_optimizer(
 
 
 def train_model(
-    model: TMoELLaVAMicro,
+    model: TMoEAntiDroneDetector,
     loader: DataLoader,
     config: ExperimentConfig,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
-    tokenizer: SimpleQATokenizer | None = None,
     results_dir: Path | None = None,
     global_epoch_offset: int = 0,
 ) -> tuple[list[dict[str, float]], dict[str, Any]]:
-    weights = TMoELossWeights(
-        alpha_aux=config.alpha_aux,
-        beta_cfcr=config.beta_cfcr,
-        gamma_ortho=config.gamma_ortho,
-    )
+    weights = loss_weights(config)
     optimizer = optimizer or build_optimizer(model, config)
     history: list[dict[str, float]] = []
     last_diag: dict[str, Any] = {}
+    global_step = 0
 
     for epoch in range(config.epochs):
         model.train()
         progress = tqdm(loader, desc=f"epoch {epoch + 1}/{config.epochs}")
         for step, batch in enumerate(progress, start=1):
+            global_step += 1
             frames = batch["frames"].to(device)
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-
             optimizer.zero_grad(set_to_none=True)
-            output = model(frames, input_ids, reset_cache=True)
-            loss, metrics = compute_losses(model, output, labels, weights)
+            output = model(frames, reset_cache=True)
+            beta = beta_for_step(config, global_step)
+            loss, metrics = compute_losses(model, output, batch, weights, beta)
             loss.backward()
             if config.grad_clip_norm is not None:
                 nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
             optimizer.step()
 
-            diag = collect_diagnostics(model, output)
+            diag = collect_diagnostics(model, output, batch)
             last_diag = diag
             row = {
                 "epoch": float(epoch + 1),
@@ -337,11 +335,17 @@ def train_model(
                 "step": float(step),
                 **metrics,
                 "cache_efficiency": diag["cache_efficiency"],
+                "patch_accuracy": diag["patch_accuracy"],
+                "positive_recall": diag["positive_recall"],
                 "routing_entropy": diag["routing_entropy"],
                 "expert_similarity": diag["expert_similarity"],
             }
             history.append(row)
-            progress.set_postfix(loss=f"{metrics['loss']:.3f}", cache=f"{diag['cache_efficiency']:.1f}%")
+            progress.set_postfix(
+                loss=f"{metrics['loss']:.3f}",
+                cache=f"{diag['cache_efficiency']:.1f}%",
+                recall=f"{diag['positive_recall']:.2f}",
+            )
 
         if config.checkpoint_every_epoch and results_dir is not None:
             save_checkpoint(
@@ -349,7 +353,6 @@ def train_model(
                 results_dir,
                 optimizer=optimizer,
                 config=config,
-                tokenizer=tokenizer,
                 epoch=epoch + 1,
                 global_epoch=global_epoch_offset + epoch + 1,
             )
@@ -357,39 +360,15 @@ def train_model(
     return history, last_diag
 
 
-def greedy_answer_predictions(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    tokenizer: SimpleQATokenizer,
-) -> tuple[list[str], float]:
-    shifted_predictions = logits[:, :-1].argmax(dim=-1)
-    shifted_labels = labels[:, 1:]
-    predictions: list[str] = []
-    total = 0
-    correct = 0
-    for row_pred, row_label in zip(shifted_predictions, shifted_labels):
-        mask = row_label != -100
-        selected = row_pred[mask]
-        target = row_label[mask]
-        total += int(mask.sum().item())
-        if selected.numel() > 0:
-            correct += int((selected == target).sum().item())
-        predictions.append(tokenizer.decode(selected))
-    return predictions, correct / max(total, 1)
-
-
 def evaluate_model(
-    model: TMoELLaVAMicro,
+    model: TMoEAntiDroneDetector,
     loader: DataLoader,
-    tokenizer: SimpleQATokenizer,
     config: ExperimentConfig,
     device: torch.device,
-) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[dict[str, float], dict[str, Any]]:
     model.eval()
-    losses = []
-    token_accuracies = []
-    exact_matches = []
-    samples: list[dict[str, Any]] = []
+    weights = loss_weights(config)
+    metric_rows = []
     last_diag: dict[str, Any] = {}
     max_batches = config.eval_batches if config.smoke else None
 
@@ -398,50 +377,29 @@ def evaluate_model(
             if max_batches is not None and batch_idx > max_batches:
                 break
             frames = batch["frames"].to(device)
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-            output = model(frames, input_ids, reset_cache=True)
-            ar = autoregressive_loss(output.logits, labels)
-            predictions, token_accuracy = greedy_answer_predictions(
-                output.logits,
-                labels,
-                tokenizer,
-            )
-            diag = collect_diagnostics(model, output)
+            output = model(frames, reset_cache=True)
+            _, metrics = compute_losses(model, output, batch, weights, beta_cfcr=0.0)
+            diag = collect_diagnostics(model, output, batch)
             last_diag = diag
+            metric_rows.append(
+                {
+                    **metrics,
+                    "cache_efficiency": diag["cache_efficiency"],
+                    "patch_accuracy": diag["patch_accuracy"],
+                    "positive_recall": diag["positive_recall"],
+                    "positive_precision": diag["positive_precision"],
+                    "routing_entropy": diag["routing_entropy"],
+                    "expert_similarity": diag["expert_similarity"],
+                }
+            )
 
-            losses.append(float(ar.cpu()))
-            token_accuracies.append(token_accuracy)
-            for question, answer, pred, q_type, video in zip(
-                batch["questions"],
-                batch["answers"],
-                predictions,
-                batch["question_types"],
-                batch["video_names"],
-            ):
-                exact = answer.strip().lower() == pred.strip().lower()
-                exact_matches.append(float(exact))
-                if len(samples) < 50:
-                    samples.append(
-                        {
-                            "video_name": video,
-                            "question_type": q_type,
-                            "question": question,
-                            "answer": answer,
-                            "prediction": pred,
-                            "exact_match": exact,
-                        }
-                    )
-
+    if not metric_rows:
+        return {}, last_diag
     summary = {
-        "eval_ar_loss": float(np.mean(losses)) if losses else 0.0,
-        "token_accuracy": float(np.mean(token_accuracies)) if token_accuracies else 0.0,
-        "exact_match": float(np.mean(exact_matches)) if exact_matches else 0.0,
-        "cache_efficiency": float(last_diag.get("cache_efficiency", 0.0)),
-        "routing_entropy": float(last_diag.get("routing_entropy", 0.0)),
-        "expert_similarity": float(last_diag.get("expert_similarity", 0.0)),
+        key: float(np.mean([row[key] for row in metric_rows]))
+        for key in metric_rows[0].keys()
     }
-    return summary, samples, last_diag
+    return summary, last_diag
 
 
 def write_history_csv(history: list[dict[str, float]], path: Path) -> None:
@@ -454,9 +412,11 @@ def write_history_csv(history: list[dict[str, float]], path: Path) -> None:
 
 
 def plot_loss_curves(history: list[dict[str, float]], results_dir: Path) -> None:
+    if not history:
+        return
     steps = np.arange(1, len(history) + 1)
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    for key in ["loss", "ar", "aux", "cfcr", "ortho"]:
+    for key in ["loss", "det", "cls", "box_l1", "giou", "aux", "cfcr"]:
         axes[0].plot(steps, [row[key] for row in history], label=key)
     axes[0].set_title("Training Loss Components")
     axes[0].set_xlabel("Step")
@@ -464,9 +424,9 @@ def plot_loss_curves(history: list[dict[str, float]], results_dir: Path) -> None
     axes[0].grid(alpha=0.3)
     axes[0].legend()
 
-    for key in ["cache_efficiency", "routing_entropy", "expert_similarity"]:
+    for key in ["cache_efficiency", "patch_accuracy", "positive_recall", "routing_entropy"]:
         axes[1].plot(steps, [row[key] for row in history], label=key)
-    axes[1].set_title("Routing And Cache Dynamics")
+    axes[1].set_title("Detection, Routing, And Cache Dynamics")
     axes[1].set_xlabel("Step")
     axes[1].grid(alpha=0.3)
     axes[1].legend()
@@ -496,15 +456,16 @@ def generate_visualizations(
 ) -> None:
     plot_loss_curves(history, results_dir)
 
-    metrics = ["eval_ar_loss", "token_accuracy", "exact_match", "cache_efficiency"]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(metrics, [eval_summary[key] for key in metrics], color=["#4c78a8", "#f58518", "#54a24b", "#e45756"])
-    ax.set_title("Evaluation Summary")
-    ax.tick_params(axis="x", rotation=20)
-    ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(results_dir / "evaluation_summary.png", dpi=180)
-    plt.close(fig)
+    if eval_summary:
+        metrics = ["loss", "patch_accuracy", "positive_recall", "cache_efficiency"]
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.bar(metrics, [eval_summary[key] for key in metrics], color=["#4c78a8", "#f58518", "#54a24b", "#e45756"])
+        ax.set_title("Anti-UAV Evaluation Summary")
+        ax.tick_params(axis="x", rotation=20)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(results_dir / "evaluation_summary.png", dpi=180)
+        plt.close(fig)
 
     if train_diag:
         plot_heatmap(
@@ -544,11 +505,10 @@ def generate_visualizations(
 
 
 def save_checkpoint(
-    model: TMoELLaVAMicro,
+    model: TMoEAntiDroneDetector,
     results_dir: Path,
     optimizer: torch.optim.Optimizer | None = None,
     config: ExperimentConfig | None = None,
-    tokenizer: SimpleQATokenizer | None = None,
     epoch: int | None = None,
     global_epoch: int | None = None,
     name: str | None = None,
@@ -557,13 +517,12 @@ def save_checkpoint(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     if name is None:
         checkpoint_epoch = global_epoch if global_epoch is not None else epoch
-        name = f"epoch_{checkpoint_epoch:03d}.pt" if checkpoint_epoch is not None else "tmoe_micro.pt"
+        name = f"epoch_{checkpoint_epoch:03d}.pt" if checkpoint_epoch is not None else "tmoe_antiuav.pt"
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "model_config": asdict(model.config),
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "experiment_config": asdict(config) if config is not None else None,
-        "tokenizer_vocab": tokenizer.vocab if tokenizer is not None else None,
         "epoch": epoch,
         "global_epoch": global_epoch,
     }
@@ -574,14 +533,14 @@ def save_checkpoint(
 
 
 def load_checkpoint_if_requested(
-    model: TMoELLaVAMicro,
+    model: TMoEAntiDroneDetector,
     optimizer: torch.optim.Optimizer,
-    config: ExperimentConfig,
+    checkpoint_path: str | None,
     device: torch.device,
 ) -> dict[str, Any] | None:
-    if config.resume_checkpoint is None:
+    if checkpoint_path is None:
         return None
-    checkpoint = torch.load(config.resume_checkpoint, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict)
     optimizer_state = checkpoint.get("optimizer_state_dict")
@@ -592,27 +551,25 @@ def load_checkpoint_if_requested(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--smoke", dest="smoke", action="store_true", help="Run 1 epoch on 5%% of ActivityNetQA")
-    parser.add_argument("--full", dest="smoke", action="store_false", help="Run the full configured experiment")
+    parser.add_argument("--smoke", dest="smoke", action="store_true", help="Run a synthetic smoke experiment")
+    parser.add_argument("--full", dest="smoke", action="store_false", help="Run with real COCO paths")
     parser.set_defaults(smoke=DEFAULT_CONFIG.smoke)
+    parser.add_argument("--dataset-url", type=str, default=DEFAULT_CONFIG.dataset_url)
+    parser.add_argument("--train-image-root", type=str, default=DEFAULT_CONFIG.train_image_root)
+    parser.add_argument("--train-ann-file", type=str, default=DEFAULT_CONFIG.train_ann_file)
+    parser.add_argument("--val-image-root", type=str, default=DEFAULT_CONFIG.val_image_root)
+    parser.add_argument("--val-ann-file", type=str, default=DEFAULT_CONFIG.val_ann_file)
     parser.add_argument("--results-dir", type=str, default=DEFAULT_CONFIG.results_dir)
-    parser.add_argument("--dataset-name", type=str, default=DEFAULT_CONFIG.dataset_name)
-    parser.add_argument("--dataset-split", type=str, default=DEFAULT_CONFIG.dataset_split)
-    parser.add_argument(
-        "--metadata-file",
-        type=str,
-        default=DEFAULT_CONFIG.metadata_file,
-        help="Local ActivityNetQA metadata parquet file. If omitted, metadata is loaded from --dataset-name.",
-    )
-    parser.add_argument("--video-root", type=str, default=DEFAULT_CONFIG.video_root)
-    parser.add_argument(
-        "--require-real-videos",
-        action="store_true",
-        help="Fail instead of using proxy frames when --video-root clips are missing or unreadable",
-    )
-    parser.add_argument("--resume-checkpoint", type=str, default=DEFAULT_CONFIG.resume_checkpoint)
+    parser.add_argument("--stage", choices=["dense", "sparse"], default=DEFAULT_CONFIG.stage)
+    parser.add_argument("--resume-checkpoint", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None, help="Override smoke/full epoch count")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG.batch_size)
+    parser.add_argument("--num-frames", type=int, default=DEFAULT_CONFIG.num_frames)
+    parser.add_argument("--height", type=int, default=DEFAULT_CONFIG.frame_height)
+    parser.add_argument("--width", type=int, default=DEFAULT_CONFIG.frame_width)
+    parser.add_argument("--patch-grid-size", type=int, default=DEFAULT_CONFIG.patch_grid_size)
+    parser.add_argument("--hidden-dim", type=int, default=DEFAULT_CONFIG.hidden_dim)
+    parser.add_argument("--ffn-dim", type=int, default=DEFAULT_CONFIG.ffn_dim)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -620,14 +577,20 @@ def parse_args() -> argparse.Namespace:
 def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
     config = ExperimentConfig(
         smoke=args.smoke,
+        dataset_url=args.dataset_url,
+        train_image_root=args.train_image_root,
+        train_ann_file=args.train_ann_file,
+        val_image_root=args.val_image_root,
+        val_ann_file=args.val_ann_file,
         results_dir=args.results_dir,
-        dataset_name=args.dataset_name,
-        dataset_split=args.dataset_split,
-        metadata_file=args.metadata_file,
-        video_root=args.video_root,
-        require_real_videos=args.require_real_videos,
-        resume_checkpoint=args.resume_checkpoint,
+        stage=args.stage,
         batch_size=args.batch_size,
+        num_frames=args.num_frames,
+        frame_height=args.height,
+        frame_width=args.width,
+        patch_grid_size=args.patch_grid_size,
+        hidden_dim=args.hidden_dim,
+        ffn_dim=args.ffn_dim,
     )
     if args.epochs is not None:
         if config.smoke:
@@ -646,15 +609,18 @@ def main() -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
 
     print(
-        "Running T-MoE-LLaVA ActivityNetQA experiment "
+        "Running T-MoE Anti-UAV detector "
         f"mode={'smoke' if config.smoke else 'full'} "
-        f"epochs={config.epochs} data_fraction={config.data_fraction:.2f}"
+        f"stage={config.stage} epochs={config.epochs} "
+        f"dataset={config.dataset_url}"
     )
 
-    train_loader, test_loader, tokenizer, sizes = make_dataloaders(config)
-    model = TMoELLaVAMicro(build_model_config(config, tokenizer.vocab_size)).to(device)
+    train_loader, val_loader, sizes = make_dataloaders(config)
+    model = TMoEAntiDroneDetector(build_model_config(config)).to(device)
+    if config.expert_noise_std > 0:
+        model.add_expert_noise(config.expert_noise_std)
     optimizer = build_optimizer(model, config)
-    checkpoint = load_checkpoint_if_requested(model, optimizer, config, device)
+    checkpoint = load_checkpoint_if_requested(model, optimizer, args.resume_checkpoint, device)
     global_epoch_offset = int((checkpoint or {}).get("global_epoch") or 0)
 
     history, train_diag = train_model(
@@ -663,17 +629,10 @@ def main() -> None:
         config,
         device,
         optimizer=optimizer,
-        tokenizer=tokenizer,
         results_dir=results_dir,
         global_epoch_offset=global_epoch_offset,
     )
-    eval_summary, samples, eval_diag = evaluate_model(
-        model,
-        test_loader,
-        tokenizer,
-        config,
-        device,
-    )
+    eval_summary, eval_diag = evaluate_model(model, val_loader, config, device)
 
     write_history_csv(history, results_dir / "train_history.csv")
     (results_dir / "config.json").write_text(
@@ -684,20 +643,15 @@ def main() -> None:
         json.dumps(eval_summary, indent=2),
         encoding="utf-8",
     )
-    (results_dir / "sample_predictions.json").write_text(
-        json.dumps(samples, indent=2),
-        encoding="utf-8",
-    )
     generate_visualizations(history, eval_summary, train_diag, eval_diag, results_dir)
     save_checkpoint(
         model,
         results_dir,
         optimizer=optimizer,
         config=config,
-        tokenizer=tokenizer,
         epoch=config.epochs,
         global_epoch=global_epoch_offset + config.epochs,
-        name="tmoe_micro_final.pt",
+        name="tmoe_antiuav_final.pt",
     )
 
     print("Experiment complete.")

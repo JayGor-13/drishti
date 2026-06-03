@@ -118,12 +118,14 @@ class MicroMoELayer(nn.Module):
         lora_rank: int = 0,
         lora_alpha: float = 1.0,
         freeze_base: bool = False,
+        dense_routing: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.ffn_dim = ffn_dim
         self.num_experts = num_experts
         self.top_k = top_k
+        self.dense_routing = dense_routing
         self.router = TemporallyAwareRouter(
             hidden_dim=hidden_dim,
             num_experts=num_experts,
@@ -146,6 +148,9 @@ class MicroMoELayer(nn.Module):
         )
 
     def _run_experts(self, flat_tokens: Tensor, flat_router: RouterOutput) -> Tensor:
+        if self.dense_routing:
+            return torch.stack([expert(flat_tokens) for expert in self.experts], dim=0).mean(dim=0)
+
         flat_topk_idx = flat_router.topk_indices.reshape(-1, self.top_k)
         flat_topk_scores = flat_router.topk_scores.reshape(-1, self.top_k)
         output = torch.zeros_like(flat_tokens)

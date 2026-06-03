@@ -1,4 +1,4 @@
-"""Loss functions for routing, temporal consistency, and expert diversity."""
+"""Loss functions for Anti-UAV detection, routing, and temporal consistency."""
 
 from __future__ import annotations
 
@@ -15,27 +15,100 @@ from models.moe_layer import SwiGLUExpert
 class TMoELossWeights:
     alpha_aux: float = 0.01
     beta_cfcr: float = 0.1
-    gamma_ortho: float = 0.01
+    gamma_ortho: float = 0.0
+    lambda_box: float = 5.0
+    lambda_giou: float = 2.0
 
 
-def autoregressive_loss(
-    logits: Tensor,
-    labels: Tensor,
-    ignore_index: int = -100,
+def focal_classification_loss(
+    class_logits: Tensor,
+    class_targets: Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
 ) -> Tensor:
-    """Causal next-token cross entropy."""
+    """Multi-class focal loss for patch-wise drone/no-drone labels."""
 
-    if logits.ndim != 3:
-        raise ValueError("logits must have shape [batch, sequence, vocab]")
-    if labels.shape != logits.shape[:2]:
-        raise ValueError("labels must have shape [batch, sequence]")
-    shift_logits = logits[:, :-1].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
-    return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.shape[-1]),
-        shift_labels.view(-1),
-        ignore_index=ignore_index,
-    )
+    if class_logits.shape[:-1] != class_targets.shape:
+        raise ValueError("class_targets must match class_logits without class dimension")
+    num_classes = class_logits.shape[-1]
+    flat_logits = class_logits.reshape(-1, num_classes)
+    flat_targets = class_targets.reshape(-1).long()
+    ce = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+    pt = torch.exp(-ce)
+    alpha_t = torch.where(flat_targets > 0, alpha, 1.0 - alpha).to(ce.dtype)
+    return (alpha_t * (1.0 - pt).pow(gamma) * ce).mean()
+
+
+def cxcywh_to_xyxy(boxes: Tensor) -> Tensor:
+    cx, cy, width, height = boxes.unbind(dim=-1)
+    half_w = width / 2.0
+    half_h = height / 2.0
+    return torch.stack([cx - half_w, cy - half_h, cx + half_w, cy + half_h], dim=-1)
+
+
+def generalized_box_iou_aligned(pred_boxes: Tensor, target_boxes: Tensor) -> Tensor:
+    """Aligned GIoU for normalized ``cx, cy, w, h`` boxes."""
+
+    pred = cxcywh_to_xyxy(pred_boxes).clamp(0.0, 1.0)
+    target = cxcywh_to_xyxy(target_boxes).clamp(0.0, 1.0)
+
+    inter_top_left = torch.maximum(pred[:, :2], target[:, :2])
+    inter_bottom_right = torch.minimum(pred[:, 2:], target[:, 2:])
+    inter_wh = (inter_bottom_right - inter_top_left).clamp_min(0.0)
+    inter_area = inter_wh[:, 0] * inter_wh[:, 1]
+
+    pred_wh = (pred[:, 2:] - pred[:, :2]).clamp_min(0.0)
+    target_wh = (target[:, 2:] - target[:, :2]).clamp_min(0.0)
+    pred_area = pred_wh[:, 0] * pred_wh[:, 1]
+    target_area = target_wh[:, 0] * target_wh[:, 1]
+    union = (pred_area + target_area - inter_area).clamp_min(1e-7)
+    iou = inter_area / union
+
+    enclosing_top_left = torch.minimum(pred[:, :2], target[:, :2])
+    enclosing_bottom_right = torch.maximum(pred[:, 2:], target[:, 2:])
+    enclosing_wh = (enclosing_bottom_right - enclosing_top_left).clamp_min(0.0)
+    enclosing_area = (enclosing_wh[:, 0] * enclosing_wh[:, 1]).clamp_min(1e-7)
+    return iou - (enclosing_area - union) / enclosing_area
+
+
+def detection_loss(
+    class_logits: Tensor,
+    pred_boxes: Tensor,
+    class_targets: Tensor,
+    box_targets: Tensor,
+    box_mask: Tensor,
+    weights: TMoELossWeights = TMoELossWeights(),
+) -> dict[str, Tensor]:
+    """Patch detection loss from the architecture plan.
+
+    ``class_targets`` is ``0`` for background and ``1`` for drone. Boxes are
+    normalized ``cx, cy, w, h`` values assigned to the patch containing each
+    drone center.
+    """
+
+    cls = focal_classification_loss(class_logits, class_targets)
+    if pred_boxes.shape != box_targets.shape:
+        raise ValueError("pred_boxes and box_targets must have the same shape")
+    if box_mask.shape != pred_boxes.shape[:-1]:
+        raise ValueError("box_mask must match pred_boxes without box dimension")
+
+    if box_mask.any():
+        pred_pos = pred_boxes[box_mask]
+        target_pos = box_targets[box_mask]
+        l1 = F.smooth_l1_loss(pred_pos, target_pos)
+        giou = generalized_box_iou_aligned(pred_pos, target_pos)
+        giou_loss = (1.0 - giou).mean()
+    else:
+        l1 = pred_boxes.new_zeros(())
+        giou_loss = pred_boxes.new_zeros(())
+
+    total = cls + weights.lambda_box * l1 + weights.lambda_giou * giou_loss
+    return {
+        "det": total,
+        "cls": cls,
+        "box_l1": l1,
+        "giou": giou_loss,
+    }
 
 
 def load_balancing_loss(router_probs: Tensor) -> Tensor:
@@ -62,19 +135,27 @@ def js_divergence(p: Tensor, q: Tensor) -> Tensor:
     return 0.5 * _kl_divergence(p, midpoint) + 0.5 * _kl_divergence(q, midpoint)
 
 
+def semantic_alignment(semantic_tokens: Tensor, temperature: float = 0.1) -> Tensor:
+    """Cosine-similarity patch alignment for adjacent frames."""
+
+    if semantic_tokens.ndim != 4:
+        raise ValueError("semantic_tokens must have shape [batch, time, patches, hidden]")
+    batch, time, patches, _ = semantic_tokens.shape
+    if time < 2:
+        return semantic_tokens.new_empty(batch, 0, patches, patches)
+
+    current = F.normalize(semantic_tokens[:, :-1], dim=-1)
+    nxt = F.normalize(semantic_tokens[:, 1:], dim=-1)
+    similarity = torch.einsum("btih,btjh->btij", current, nxt)
+    return torch.softmax(similarity / temperature, dim=-1)
+
+
 def cfcr_loss(
     router_probs: Tensor,
     motion_confidence: Tensor,
     alignment: Tensor | None = None,
 ) -> Tensor:
-    """Cross-frame consistent routing loss with optional patch alignment.
-
-    Args:
-        router_probs: ``[batch, time, patches, experts]``.
-        motion_confidence: ``[batch, time, patches]``.
-        alignment: Optional ``[batch, time - 1, patches, patches]`` matrix.
-            If omitted, identity alignment is used.
-    """
+    """Cross-frame consistent routing loss with optional patch alignment."""
 
     if router_probs.ndim != 4:
         raise ValueError("router_probs must have shape [batch, time, patches, experts]")
@@ -125,24 +206,41 @@ def orthogonalization_loss(experts: nn.ModuleList | list[SwiGLUExpert]) -> Tenso
     return expert_lora_similarity(experts)
 
 
-def total_tmoe_loss(
-    logits: Tensor,
-    labels: Tensor,
+def total_antiuav_loss(
+    class_logits: Tensor,
+    pred_boxes: Tensor,
+    class_targets: Tensor,
+    box_targets: Tensor,
+    box_mask: Tensor,
     router_probs: Tensor,
     motion_confidence: Tensor,
     experts: nn.ModuleList | list[SwiGLUExpert],
+    semantic_tokens: Tensor | None = None,
     weights: TMoELossWeights = TMoELossWeights(),
+    beta_cfcr: float | None = None,
 ) -> dict[str, Tensor]:
-    ar = autoregressive_loss(logits, labels)
+    det_parts = detection_loss(
+        class_logits,
+        pred_boxes,
+        class_targets,
+        box_targets,
+        box_mask,
+        weights=weights,
+    )
     aux = load_balancing_loss(router_probs)
-    cfcr = cfcr_loss(router_probs, motion_confidence)
+    alignment = semantic_alignment(semantic_tokens) if semantic_tokens is not None else None
+    cfcr = cfcr_loss(router_probs, motion_confidence, alignment=alignment)
     ortho = orthogonalization_loss(experts)
-    total = ar + weights.alpha_aux * aux + weights.beta_cfcr * cfcr
+    beta = weights.beta_cfcr if beta_cfcr is None else beta_cfcr
+    total = det_parts["det"] + weights.alpha_aux * aux + beta * cfcr
     total = total + weights.gamma_ortho * ortho
     return {
         "loss": total,
-        "ar": ar,
+        **det_parts,
         "aux": aux,
         "cfcr": cfcr,
         "ortho": ortho,
     }
+
+
+total_tmoe_loss = total_antiuav_loss

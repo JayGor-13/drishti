@@ -3,12 +3,14 @@ set -euo pipefail
 
 MODE="--smoke"
 RESULTS_DIR="results"
-BATCH_SIZE="4"
+BATCH_SIZE="2"
 EPOCHS=""
 DEVICE=""
-METADATA_FILE=""
-VIDEO_ROOT=""
-REQUIRE_REAL_VIDEOS="0"
+TRAIN_IMAGE_ROOT=""
+TRAIN_ANN_FILE=""
+VAL_IMAGE_ROOT=""
+VAL_ANN_FILE=""
+STAGE="sparse"
 RESUME_CHECKPOINT=""
 
 while [[ $# -gt 0 ]]; do
@@ -37,17 +39,25 @@ while [[ $# -gt 0 ]]; do
       DEVICE="$2"
       shift 2
       ;;
-    --metadata-file)
-      METADATA_FILE="$2"
+    --train-image-root)
+      TRAIN_IMAGE_ROOT="$2"
       shift 2
       ;;
-    --video-root)
-      VIDEO_ROOT="$2"
+    --train-ann-file)
+      TRAIN_ANN_FILE="$2"
       shift 2
       ;;
-    --require-real-videos)
-      REQUIRE_REAL_VIDEOS="1"
-      shift
+    --val-image-root)
+      VAL_IMAGE_ROOT="$2"
+      shift 2
+      ;;
+    --val-ann-file)
+      VAL_ANN_FILE="$2"
+      shift 2
+      ;;
+    --stage)
+      STAGE="$2"
+      shift 2
       ;;
     --resume-checkpoint)
       RESUME_CHECKPOINT="$2"
@@ -64,15 +74,18 @@ DEVICE_ARGS=()
 if [[ -n "$DEVICE" ]]; then
   DEVICE_ARGS=(--device "$DEVICE")
 fi
-VIDEO_ARGS=()
-if [[ -n "$METADATA_FILE" ]]; then
-  VIDEO_ARGS+=(--metadata-file "$METADATA_FILE")
+DATA_ARGS=()
+if [[ -n "$TRAIN_IMAGE_ROOT" ]]; then
+  DATA_ARGS+=(--train-image-root "$TRAIN_IMAGE_ROOT")
 fi
-if [[ -n "$VIDEO_ROOT" ]]; then
-  VIDEO_ARGS+=(--video-root "$VIDEO_ROOT")
+if [[ -n "$TRAIN_ANN_FILE" ]]; then
+  DATA_ARGS+=(--train-ann-file "$TRAIN_ANN_FILE")
 fi
-if [[ "$REQUIRE_REAL_VIDEOS" == "1" ]]; then
-  VIDEO_ARGS+=(--require-real-videos)
+if [[ -n "$VAL_IMAGE_ROOT" ]]; then
+  DATA_ARGS+=(--val-image-root "$VAL_IMAGE_ROOT")
+fi
+if [[ -n "$VAL_ANN_FILE" ]]; then
+  DATA_ARGS+=(--val-ann-file "$VAL_ANN_FILE")
 fi
 EPOCH_ARGS=()
 if [[ -n "$EPOCHS" ]]; then
@@ -83,4 +96,4 @@ if [[ -n "$RESUME_CHECKPOINT" ]]; then
   RESUME_ARGS=(--resume-checkpoint "$RESUME_CHECKPOINT")
 fi
 
-python experiment.py "$MODE" --results-dir "$RESULTS_DIR" --batch-size "$BATCH_SIZE" "${EPOCH_ARGS[@]}" "${DEVICE_ARGS[@]}" "${VIDEO_ARGS[@]}" "${RESUME_ARGS[@]}"
+python experiment.py "$MODE" --stage "$STAGE" --results-dir "$RESULTS_DIR" --batch-size "$BATCH_SIZE" "${EPOCH_ARGS[@]}" "${DEVICE_ARGS[@]}" "${DATA_ARGS[@]}" "${RESUME_ARGS[@]}"

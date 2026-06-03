@@ -3,21 +3,21 @@ import pytest
 
 from models.cache import EventTokenCache
 from models.moe_layer import MicroMoELayer
-from models.router import TemporallyAwareRouter
-from models.tmoe_model import TMoEConfig, TMoELLaVAMicro
-from train import (
-    ActivityNetQARecord,
-    VideoFileIndex,
-    filter_records_with_available_videos,
-    load_activitynetqa_records,
+from models.router import ModalityAwareRouter
+from models.tmoe_model import TMoEAntiDroneDetector, TMoEConfig
+from train import AntiUAVDetectionCollator, SyntheticAntiUAVDataset
+from train.loss import (
+    cfcr_loss,
+    detection_loss,
+    expert_lora_similarity,
+    load_balancing_loss,
+    semantic_alignment,
 )
-from train.loss import cfcr_loss, expert_lora_similarity, load_balancing_loss
 from train.trainer import TMoETrainer, TrainingConfig
 
 
 def tiny_config() -> TMoEConfig:
     return TMoEConfig(
-        vocab_size=97,
         hidden_dim=32,
         ffn_dim=64,
         num_experts=4,
@@ -28,21 +28,23 @@ def tiny_config() -> TMoEConfig:
         motion_dim=16,
         lora_rank=2,
         lora_alpha=4.0,
-        max_text_length=16,
+        cache_threshold=0.15,
+        max_frames=8,
     )
 
 
-def test_sequence_concatenation_shape():
+def test_detector_output_shape_and_finiteness():
     torch.manual_seed(0)
-    model = TMoELLaVAMicro(tiny_config())
+    model = TMoEAntiDroneDetector(tiny_config())
     frames = torch.randn(2, 3, 3, 16, 16)
-    input_ids = torch.randint(0, model.config.vocab_size, (2, 5))
 
-    video_tokens, motion_embeddings, _ = model.encode_video(frames)
-    sequence = model.build_multimodal_sequence(video_tokens, motion_embeddings, input_ids)
+    output = model(frames, reset_cache=True)
 
     patches = model.config.patch_grid_size**2
-    assert sequence.shape == (2, 3 * patches * 2 + 5, model.config.hidden_dim)
+    assert output.class_logits.shape == (2, 3, patches, 2)
+    assert output.boxes.shape == (2, 3, patches, 4)
+    assert torch.isfinite(output.class_logits).all()
+    assert torch.all((output.boxes >= 0.0) & (output.boxes <= 1.0))
 
 
 def test_cache_bypasses_static_second_frame():
@@ -88,9 +90,7 @@ def test_token_level_cache_mixed_motion():
         nonlocal expert_token_rows
         expert_token_rows += inputs[0].shape[0]
 
-    handles = [
-        expert.register_forward_hook(count_expert_rows) for expert in layer.experts
-    ]
+    handles = [expert.register_forward_hook(count_expert_rows) for expert in layer.experts]
     try:
         output = layer(tokens, motion_confidence=motion_confidence, cache=cache)
     finally:
@@ -104,18 +104,21 @@ def test_token_level_cache_mixed_motion():
     assert torch.allclose(ffn_branch[:, 1, :2], ffn_branch[:, 0, :2], atol=1e-6)
 
 
-def test_router_gradients_flow():
+def test_modality_router_uses_motion_embeddings():
     torch.manual_seed(2)
-    router = TemporallyAwareRouter(hidden_dim=12, num_experts=4, top_k=2)
+    router = ModalityAwareRouter(hidden_dim=12, num_experts=4, top_k=2)
     tokens = torch.randn(2, 3, 5, 12, requires_grad=True)
+    still_motion = torch.zeros_like(tokens)
+    moving_motion = torch.ones_like(tokens)
 
-    result = router(tokens)
-    loss = (result.probs[..., 0] ** 2).mean()
+    still = router(tokens, still_motion)
+    moving = router(tokens, moving_motion)
+    loss = (moving.probs[..., 0] ** 2).mean()
     loss.backward()
 
+    assert not torch.allclose(still.logits, moving.logits)
     assert tokens.grad is not None
-    assert router.token_gate.weight.grad is not None
-    assert router.context_gate.weight.grad is not None
+    assert router.gate.weight.grad is not None
 
 
 def test_expert_lora_similarity_can_detect_divergence():
@@ -151,74 +154,93 @@ def test_cfcr_loss_monotonicity():
     assert changed_loss.item() > static_loss.item()
 
 
-def test_lm_head_output_shape_and_finiteness():
+def test_semantic_alignment_shape():
+    features = torch.randn(2, 4, 5, 8)
+    alignment = semantic_alignment(features)
+
+    assert alignment.shape == (2, 3, 5, 5)
+    assert torch.allclose(alignment.sum(dim=-1), torch.ones(2, 3, 5), atol=1e-5)
+
+
+def test_collator_assigns_box_to_patch():
+    collator = AntiUAVDetectionCollator(patch_grid_size=4)
+    item = {
+        "frames": torch.zeros(2, 3, 16, 16),
+        "frame_targets": [
+            {"boxes": torch.tensor([[0.6, 0.2, 0.1, 0.1]]), "labels": torch.ones(1, dtype=torch.long)},
+            {"boxes": torch.tensor([[0.1, 0.9, 0.2, 0.2]]), "labels": torch.ones(1, dtype=torch.long)},
+        ],
+        "image_ids": [1, 2],
+    }
+
+    batch = collator([item])
+
+    assert batch["frames"].shape == (1, 2, 3, 16, 16)
+    assert batch["class_targets"].sum().item() == 2
+    assert batch["box_mask"].sum().item() == 2
+    assert batch["box_targets"].shape == (1, 2, 16, 4)
+
+
+def test_detection_loss_is_finite():
     torch.manual_seed(4)
-    model = TMoELLaVAMicro(tiny_config())
-    frames = torch.randn(1, 2, 3, 16, 16)
-    input_ids = torch.randint(0, model.config.vocab_size, (1, 6))
+    logits = torch.randn(1, 2, 4, 2)
+    boxes = torch.rand(1, 2, 4, 4)
+    targets = torch.zeros(1, 2, 4, dtype=torch.long)
+    targets[:, :, 1] = 1
+    box_targets = torch.rand(1, 2, 4, 4)
+    mask = targets == 1
 
-    output = model(frames, input_ids, reset_cache=True)
+    parts = detection_loss(logits, boxes, targets, box_targets, mask)
 
-    assert output.next_token_logits.shape == (1, model.config.vocab_size)
-    assert torch.isfinite(output.next_token_logits).all()
+    assert torch.isfinite(parts["det"])
+    assert parts["det"].item() > 0.0
 
 
-def test_trainer_averages_aux_loss_across_layers():
+def test_dense_routing_runs_all_experts_once_per_token():
     torch.manual_seed(6)
-    config = tiny_config()
-    config.num_layers = 2
-    model = TMoELLaVAMicro(config)
-    with torch.no_grad():
-        first_router = model.blocks[0].moe.router
-        first_router.token_gate.weight.zero_()
-        first_router.context_gate.weight.zero_()
-        if first_router.motion_gate is not None:
-            first_router.motion_gate.weight.zero_()
+    hidden = 10
+    layer = MicroMoELayer(
+        hidden_dim=hidden,
+        ffn_dim=20,
+        num_experts=4,
+        top_k=2,
+        dense_routing=True,
+    )
+    tokens = torch.randn(1, 2, 3, hidden)
+    expert_token_rows = 0
 
+    def count_expert_rows(_module, inputs, _output):
+        nonlocal expert_token_rows
+        expert_token_rows += inputs[0].shape[0]
+
+    handles = [expert.register_forward_hook(count_expert_rows) for expert in layer.experts]
+    try:
+        output = layer(tokens)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert output.stats.executed_tokens == 6
+    assert expert_token_rows == 24
+
+
+def test_trainer_step_optimizes_antiuav_batch():
+    torch.manual_seed(7)
+    dataset = SyntheticAntiUAVDataset(num_samples=2, num_frames=3, height=16, width=16)
+    collator = AntiUAVDetectionCollator(patch_grid_size=2)
+    batch = collator([dataset[0], dataset[1]])
+    model = TMoEAntiDroneDetector(tiny_config())
     trainer = TMoETrainer(
         model,
-        TrainingConfig(learning_rate=0.0, weight_decay=0.0),
+        TrainingConfig(learning_rate=0.0, weight_decay=0.0, cfcr_warmup_steps=1),
     )
-    frames = torch.randn(1, 2, 3, 16, 16)
-    input_ids = torch.randint(0, config.vocab_size, (1, 6))
-    labels = input_ids.clone()
 
-    metrics = trainer.train_step(frames, input_ids, labels)
+    metrics = trainer.train_step(batch)
     with torch.no_grad():
-        output = model(frames, input_ids, reset_cache=True)
+        output = model(batch["frames"], reset_cache=True)
         expected_aux = torch.stack(
             [load_balancing_loss(router.probs) for router in output.router_outputs]
         ).mean()
 
     assert metrics["aux"] == pytest.approx(expected_aux.item(), rel=1e-6)
-
-
-def test_video_index_matches_activitynet_filename_variants(tmp_path):
-    nested = tmp_path / "videos"
-    nested.mkdir()
-    (nested / "v_abc-123.mp4").write_bytes(b"not a real video")
-    records = [
-        ActivityNetQARecord("abc-123", "v_abc-123_2", "q", "a", "3"),
-        ActivityNetQARecord("missing", "v_missing_1", "q", "a", "3"),
-    ]
-
-    index = VideoFileIndex(tmp_path)
-    filtered = filter_records_with_available_videos(records, tmp_path)
-
-    assert index.find(records[0]) == nested / "v_abc-123.mp4"
-    assert filtered == [records[0]]
-
-
-def test_load_activitynetqa_records_from_local_metadata_file(tmp_path):
-    metadata = tmp_path / "activitynetqa.csv"
-    metadata.write_text(
-        "video_name,question_id,question,answer,type\n"
-        "abc-123,q1,What happens?,A person jumps,motion\n",
-        encoding="utf-8",
-    )
-
-    records = load_activitynetqa_records(metadata_file=str(metadata))
-
-    assert records == [
-        ActivityNetQARecord("abc-123", "q1", "What happens?", "A person jumps", "motion")
-    ]
+    assert metrics["det"] > 0.0
