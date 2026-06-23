@@ -562,3 +562,15 @@ class AntiUAVDetectionCollator:
             "image_ids": [item["image_ids"] for item in batch],
             "dataset_url": batch[0].get("dataset_url", MODELSCOPE_ANTI_UAV_URL),
         }
+
+
+class DRISHTICollator:
+    """Batch Anti-UAV windows for DRISHTI-CORE training."""
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "frames": torch.stack([item["frames"] for item in batch]),
+            "frame_targets": [item["frame_targets"] for item in batch],
+            "image_ids": [item["image_ids"] for item in batch],
+            "dataset_url": batch[0].get("dataset_url", MODELSCOPE_ANTI_UAV_URL),
+        }

@@ -1,29 +1,29 @@
-"""Public model API for DRISHTI-CORE."""
+"""DRISHTI-CORE detector-only model package."""
 
-from .drishti import (
+from .config import DRISHTIConfig
+from .crop_encoder import FrozenCropEncoder
+from .detection_head import DRISHTIDetectionHead
+from .moe import DRISHTIMoE
+from .motion_proposal import MotionCropProposal
+from .pipeline import DRISHTIPipeline
+from .temporal_fusion import TemporalFusion
+from .types import (
     CropProposalOutput,
     DetectorStageOutput,
-    DRISHTIConfig,
-    DRISHTIDetectionHead,
-    DRISHTIMoE,
     DRISHTIMoEOutput,
     DRISHTIOutput,
-    DRISHTIPipeline,
-    FrozenCropEncoder,
-    MotionCropProposal,
-    TemporalFusion,
     TemporalFusionOutput,
 )
 
 __all__ = [
     "CropProposalOutput",
-    "DetectorStageOutput",
     "DRISHTIConfig",
     "DRISHTIDetectionHead",
     "DRISHTIMoE",
     "DRISHTIMoEOutput",
     "DRISHTIOutput",
     "DRISHTIPipeline",
+    "DetectorStageOutput",
     "FrozenCropEncoder",
     "MotionCropProposal",
     "TemporalFusion",

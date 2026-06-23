@@ -1,246 +1,204 @@
 import torch
-import pytest
 
-from models.cache import EventTokenCache
-from models.moe_layer import MicroMoELayer
-from models.router import ModalityAwareRouter
-from models.tmoe_model import TMoEAntiDroneDetector, TMoEConfig
-from train import AntiUAVDetectionCollator, SyntheticAntiUAVDataset
-from train.loss import (
-    cfcr_loss,
-    detection_loss,
-    expert_lora_similarity,
-    load_balancing_loss,
-    semantic_alignment,
+from models import (
+    DRISHTIConfig,
+    DRISHTIMoE,
+    DRISHTIPipeline,
+    FrozenCropEncoder,
+    MotionCropProposal,
+    TemporalFusion,
 )
-from train.trainer import TMoETrainer, TrainingConfig
+from train import (
+    DRISHTICollator,
+    SyntheticAntiUAVDataset,
+    configure_drishti_training_stage,
+    detector_loss,
+    detector_stage_loss,
+    moe_stage_loss,
+    trainable_parameter_names,
+)
 
 
-def tiny_config() -> TMoEConfig:
-    return TMoEConfig(
-        hidden_dim=32,
-        ffn_dim=64,
-        num_experts=4,
-        top_k=2,
-        num_layers=1,
-        num_attention_heads=4,
-        patch_grid_size=2,
-        motion_dim=16,
-        lora_rank=2,
-        lora_alpha=4.0,
-        cache_threshold=0.15,
-        max_frames=8,
+def tiny_config() -> DRISHTIConfig:
+    return DRISHTIConfig(
+        crop_size=32,
+        num_crops=4,
+        feature_dim=32,
+        temporal_input_dim=33,
+        temporal_heads=4,
+        temporal_layers=1,
+        temporal_ffn_dim=64,
+        moe_num_experts=4,
+        moe_top_k=2,
+        moe_ffn_dim=64,
     )
 
 
-def test_detector_output_shape_and_finiteness():
+def synthetic_batch(num_samples: int = 2, num_frames: int = 5) -> dict:
+    dataset = SyntheticAntiUAVDataset(
+        num_samples=num_samples,
+        num_frames=num_frames,
+        height=64,
+        width=64,
+        image_channels=3,
+    )
+    return DRISHTICollator()([dataset[index] for index in range(num_samples)])
+
+
+def test_motion_crop_proposal_contract():
     torch.manual_seed(0)
-    model = TMoEAntiDroneDetector(tiny_config())
-    frames = torch.randn(2, 3, 3, 16, 16)
+    proposer = MotionCropProposal(crop_size=32, num_crops=4)
+    triplet = torch.randn(2, 9, 64, 64)
 
-    output = model(frames, reset_cache=True)
+    output = proposer(triplet)
 
-    patches = model.config.patch_grid_size**2
-    assert output.class_logits.shape == (2, 3, patches, 2)
-    assert output.boxes.shape == (2, 3, patches, 4)
-    assert torch.isfinite(output.class_logits).all()
-    assert torch.all((output.boxes >= 0.0) & (output.boxes <= 1.0))
+    assert output.crops.shape == (8, 3, 32, 32)
+    assert output.motion_scores.shape == (8, 1)
+    assert output.boxes.shape == (2, 4, 4)
+    assert output.centers.shape == (2, 4, 2)
+    assert output.heatmap.shape[:2] == (2, 1)
+    assert torch.all((output.motion_scores >= 0.0) & (output.motion_scores <= 1.0))
 
 
-def test_cache_bypasses_static_second_frame():
+def test_frozen_crop_encoder_has_no_trainable_backbone_by_default():
+    encoder = FrozenCropEncoder(feature_dim=32, image_channels=3, frozen=True)
+    crops = torch.randn(4, 3, 32, 32)
+
+    features = encoder(crops)
+
+    assert features.shape == (4, 32)
+    assert not any(parameter.requires_grad for parameter in encoder.parameters())
+
+
+def test_temporal_fusion_accepts_non_divisible_d_model():
     torch.manual_seed(1)
-    hidden = 16
-    layer = MicroMoELayer(
-        hidden_dim=hidden,
-        ffn_dim=32,
-        num_experts=4,
-        top_k=2,
-        router_history_window=1,
-    )
-    cache = EventTokenCache(threshold=0.05)
-    frame = torch.randn(1, 1, 4, hidden)
-    tokens = frame.repeat(1, 2, 1, 1)
-    motion_confidence = torch.tensor([[[1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]]])
+    fusion = TemporalFusion(tiny_config())
+    features = torch.randn(2, 5, 4, 33)
 
-    output = layer(tokens, motion_confidence=motion_confidence, cache=cache)
+    output = fusion(features)
 
-    assert output.stats.executed_tokens == 4
-    assert output.stats.cached_tokens == 4
-    assert torch.allclose(output.hidden_states[:, 0], output.hidden_states[:, 1], atol=1e-6)
+    assert output.fused_features.shape == (2, 4, 32)
+    assert output.temporal_tokens.shape == (2, 4, 5, 33)
+    assert torch.isfinite(output.fused_features).all()
 
 
-def test_token_level_cache_mixed_motion():
-    torch.manual_seed(5)
-    hidden = 12
-    layer = MicroMoELayer(
-        hidden_dim=hidden,
-        ffn_dim=24,
-        num_experts=3,
-        top_k=1,
-        router_history_window=1,
-    )
-    cache = EventTokenCache(threshold=0.05)
-    frame = torch.randn(1, 1, 4, hidden)
-    tokens = frame.repeat(1, 2, 1, 1)
-    tokens[:, 1, 2:] = tokens[:, 1, 2:] + 0.5
-    motion_confidence = torch.tensor([[[1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]]])
-    expert_token_rows = 0
-
-    def count_expert_rows(_module, inputs, _output):
-        nonlocal expert_token_rows
-        expert_token_rows += inputs[0].shape[0]
-
-    handles = [expert.register_forward_hook(count_expert_rows) for expert in layer.experts]
-    try:
-        output = layer(tokens, motion_confidence=motion_confidence, cache=cache)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    ffn_branch = output.hidden_states - tokens
-    assert output.stats.executed_tokens == 6
-    assert output.stats.cached_tokens == 2
-    assert expert_token_rows == 6
-    assert torch.allclose(ffn_branch[:, 1, :2], ffn_branch[:, 0, :2], atol=1e-6)
-
-
-def test_modality_router_uses_motion_embeddings():
+def test_sparse_moe_routes_top_two_experts():
     torch.manual_seed(2)
-    router = ModalityAwareRouter(hidden_dim=12, num_experts=4, top_k=2)
-    tokens = torch.randn(2, 3, 5, 12, requires_grad=True)
-    still_motion = torch.zeros_like(tokens)
-    moving_motion = torch.ones_like(tokens)
+    moe = DRISHTIMoE(tiny_config())
+    features = torch.randn(2, 4, 32)
 
-    still = router(tokens, still_motion)
-    moving = router(tokens, moving_motion)
-    loss = (moving.probs[..., 0] ** 2).mean()
-    loss.backward()
+    output = moe(features)
 
-    assert not torch.allclose(still.logits, moving.logits)
-    assert tokens.grad is not None
-    assert router.gate.weight.grad is not None
+    assert output.hidden_states.shape == (2, 4, 32)
+    assert output.router_probs.shape == (2, 4, 4)
+    assert output.topk_indices.shape == (2, 4, 2)
+    assert torch.allclose(output.router_probs.sum(dim=-1), torch.ones(2, 4), atol=1e-6)
+    assert torch.isfinite(output.load_balance_loss)
 
 
-def test_expert_lora_similarity_can_detect_divergence():
+def test_pipeline_forward_outputs_antiuav_predictions():
     torch.manual_seed(3)
-    layer = MicroMoELayer(
-        hidden_dim=8,
-        ffn_dim=8,
-        num_experts=4,
-        top_k=2,
-        lora_rank=1,
-        lora_alpha=2.0,
-    )
-    with torch.no_grad():
-        for idx, expert in enumerate(layer.experts):
-            for module in (expert.gate_proj, expert.up_proj, expert.down_proj):
-                module.lora_b.zero_()
-            expert.up_proj.lora_b[idx * 2 : idx * 2 + 2, 0] = 1.0
+    model = DRISHTIPipeline(tiny_config())
+    frames = torch.randn(2, 5, 3, 64, 64)
 
-    similarity = expert_lora_similarity(layer.experts)
+    output = model(frames)
 
-    assert similarity.item() < 0.2
+    assert output.heatmaps.shape[:3] == (2, 5, 1)
+    assert output.proposal_boxes.shape == (2, 4, 4)
+    assert output.temporal_features.shape == (2, 4, 32)
+    assert output.moe_features.shape == (2, 4, 32)
+    assert output.object_logits.shape == (2, 4, 1)
+    assert output.boxes.shape == (2, 4, 4)
+    assert output.predictions.shape == (2, 4, 6)
+    assert output.router_topk.shape == (2, 4, 2)
+    assert torch.all((output.predictions[..., :4] >= 0.0) & (output.predictions[..., :4] <= 1.0))
+    assert torch.all((output.predictions[..., 4:] >= 0.0) & (output.predictions[..., 4:] <= 1.0))
 
 
-def test_cfcr_loss_monotonicity():
-    same = torch.tensor([[[[0.8, 0.2], [0.1, 0.9]], [[0.8, 0.2], [0.1, 0.9]]]])
-    motion = torch.zeros(1, 2, 2)
-    changed = torch.tensor([[[[0.8, 0.2], [0.1, 0.9]], [[0.2, 0.8], [0.9, 0.1]]]])
-
-    static_loss = cfcr_loss(same, motion)
-    changed_loss = cfcr_loss(changed, motion)
-
-    assert static_loss.item() < 1e-7
-    assert changed_loss.item() > static_loss.item()
-
-
-def test_semantic_alignment_shape():
-    features = torch.randn(2, 4, 5, 8)
-    alignment = semantic_alignment(features)
-
-    assert alignment.shape == (2, 3, 5, 5)
-    assert torch.allclose(alignment.sum(dim=-1), torch.ones(2, 3, 5), atol=1e-5)
-
-
-def test_collator_assigns_box_to_patch():
-    collator = AntiUAVDetectionCollator(patch_grid_size=4)
-    item = {
-        "frames": torch.zeros(2, 3, 16, 16),
-        "frame_targets": [
-            {"boxes": torch.tensor([[0.6, 0.2, 0.1, 0.1]]), "labels": torch.ones(1, dtype=torch.long)},
-            {"boxes": torch.tensor([[0.1, 0.9, 0.2, 0.2]]), "labels": torch.ones(1, dtype=torch.long)},
-        ],
-        "image_ids": [1, 2],
-    }
-
-    batch = collator([item])
-
-    assert batch["frames"].shape == (1, 2, 3, 16, 16)
-    assert batch["class_targets"].sum().item() == 2
-    assert batch["box_mask"].sum().item() == 2
-    assert batch["box_targets"].shape == (1, 2, 16, 4)
-
-
-def test_detection_loss_is_finite():
+def test_stage_specific_forward_paths_are_detector_only_and_temporal_only():
     torch.manual_seed(4)
-    logits = torch.randn(1, 2, 4, 2)
-    boxes = torch.rand(1, 2, 4, 4)
-    targets = torch.zeros(1, 2, 4, dtype=torch.long)
-    targets[:, :, 1] = 1
-    box_targets = torch.rand(1, 2, 4, 4)
-    mask = targets == 1
+    model = DRISHTIPipeline(tiny_config())
+    frames = torch.randn(2, 5, 3, 64, 64)
 
-    parts = detection_loss(logits, boxes, targets, box_targets, mask)
+    detector_output = model.forward_detector(frames)
+    temporal_output = model.forward_temporal(frames)
 
-    assert torch.isfinite(parts["det"])
-    assert parts["det"].item() > 0.0
+    assert detector_output.crop_features.shape == (2, 4, 32)
+    assert detector_output.object_logits.shape == (2, 4, 1)
+    assert temporal_output.temporal_features.shape == (2, 4, 32)
+    assert temporal_output.load_balance_loss.item() == 0.0
 
 
-def test_dense_routing_runs_all_experts_once_per_token():
+def test_stage_freezing_follows_drishti_core_order():
+    model = DRISHTIPipeline(tiny_config())
+
+    configure_drishti_training_stage(model, "detector")
+    detector_names = trainable_parameter_names(model)
+    assert any(name.startswith("motion_proposer") for name in detector_names)
+    assert any(name.startswith("detection_head") for name in detector_names)
+    assert not any(name.startswith("crop_encoder") for name in detector_names)
+    assert not any(name.startswith("temporal_fusion") for name in detector_names)
+    assert not any(name.startswith("moe") for name in detector_names)
+
+    configure_drishti_training_stage(model, "temporal")
+    temporal_names = trainable_parameter_names(model)
+    assert temporal_names
+    assert all(name.startswith("temporal_fusion") for name in temporal_names)
+
+    configure_drishti_training_stage(model, "moe")
+    moe_names = trainable_parameter_names(model)
+    assert moe_names
+    assert all(name.startswith("moe") for name in moe_names)
+
+    configure_drishti_training_stage(model, "all")
+    all_names = trainable_parameter_names(model)
+    assert any(name.startswith("motion_proposer") for name in all_names)
+    assert any(name.startswith("temporal_fusion") for name in all_names)
+    assert any(name.startswith("moe") for name in all_names)
+    assert not any(name.startswith("crop_encoder") for name in all_names)
+
+
+def test_drishti_losses_are_finite_for_each_training_stage():
+    torch.manual_seed(5)
+    model = DRISHTIPipeline(tiny_config())
+    batch = synthetic_batch()
+    frames = batch["frames"]
+    frame_targets = batch["frame_targets"]
+
+    detector_parts = detector_stage_loss(model.forward_detector(frames), frame_targets)
+    temporal_parts = detector_loss(model.forward_temporal(frames), frame_targets)
+    moe_parts = moe_stage_loss(model(frames), frame_targets)
+
+    assert torch.isfinite(detector_parts["det"])
+    assert torch.isfinite(temporal_parts["det"])
+    assert torch.isfinite(moe_parts["loss"])
+    assert moe_parts["loss"].item() >= moe_parts["det"].item()
+
+
+def test_drishti_collator_preserves_frame_targets():
+    batch = synthetic_batch(num_samples=2, num_frames=5)
+
+    assert batch["frames"].shape == (2, 5, 3, 64, 64)
+    assert len(batch["frame_targets"]) == 2
+    assert len(batch["frame_targets"][0]) == 5
+    assert batch["frame_targets"][0][0]["boxes"].shape == (1, 4)
+
+
+def test_one_optimization_step_updates_trainable_core():
     torch.manual_seed(6)
-    hidden = 10
-    layer = MicroMoELayer(
-        hidden_dim=hidden,
-        ffn_dim=20,
-        num_experts=4,
-        top_k=2,
-        dense_routing=True,
+    model = DRISHTIPipeline(tiny_config())
+    configure_drishti_training_stage(model, "all")
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1e-4,
     )
-    tokens = torch.randn(1, 2, 3, hidden)
-    expert_token_rows = 0
+    batch = synthetic_batch()
+    before = model.motion_proposer.motion_cnn[0].weight.detach().clone()
 
-    def count_expert_rows(_module, inputs, _output):
-        nonlocal expert_token_rows
-        expert_token_rows += inputs[0].shape[0]
+    output = model(batch["frames"])
+    parts = moe_stage_loss(output, batch["frame_targets"])
+    parts["loss"].backward()
+    optimizer.step()
 
-    handles = [expert.register_forward_hook(count_expert_rows) for expert in layer.experts]
-    try:
-        output = layer(tokens)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    assert output.stats.executed_tokens == 6
-    assert expert_token_rows == 24
-
-
-def test_trainer_step_optimizes_antiuav_batch():
-    torch.manual_seed(7)
-    dataset = SyntheticAntiUAVDataset(num_samples=2, num_frames=3, height=16, width=16)
-    collator = AntiUAVDetectionCollator(patch_grid_size=2)
-    batch = collator([dataset[0], dataset[1]])
-    model = TMoEAntiDroneDetector(tiny_config())
-    trainer = TMoETrainer(
-        model,
-        TrainingConfig(learning_rate=0.0, weight_decay=0.0, cfcr_warmup_steps=1),
-    )
-
-    metrics = trainer.train_step(batch)
-    with torch.no_grad():
-        output = model(batch["frames"], reset_cache=True)
-        expected_aux = torch.stack(
-            [load_balancing_loss(router.probs) for router in output.router_outputs]
-        ).mean()
-
-    assert metrics["aux"] == pytest.approx(expected_aux.item(), rel=1e-6)
-    assert metrics["det"] > 0.0
+    after = model.motion_proposer.motion_cnn[0].weight.detach()
+    assert not torch.allclose(before, after)

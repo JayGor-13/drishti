@@ -10,7 +10,7 @@ TRAIN_IMAGE_ROOT=""
 TRAIN_ANN_FILE=""
 VAL_IMAGE_ROOT=""
 VAL_ANN_FILE=""
-STAGE="sparse"
+STAGE="all"
 RESUME_CHECKPOINT=""
 
 while [[ $# -gt 0 ]]; do

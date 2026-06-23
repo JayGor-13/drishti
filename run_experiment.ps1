@@ -8,7 +8,7 @@ param(
     [string]$TrainAnnFile = "",
     [string]$ValImageRoot = "",
     [string]$ValAnnFile = "",
-    [string]$Stage = "sparse",
+    [string]$Stage = "all",
     [string]$ResumeCheckpoint = ""
 )
 
