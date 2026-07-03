@@ -1,7 +1,6 @@
 """Model modules for DRISHTI-CORE v2."""
 
 from drishti_v2.models.config import DRISHTIConfig
-from drishti_v2.models.moe import MoEDiagnostics
 from drishti_v2.models.pipeline import DRISHTIPipeline, PipelineOutput
 
-__all__ = ["DRISHTIConfig", "DRISHTIPipeline", "PipelineOutput", "MoEDiagnostics"]
+__all__ = ["DRISHTIConfig", "DRISHTIPipeline", "PipelineOutput"]

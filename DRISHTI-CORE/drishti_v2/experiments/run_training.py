@@ -23,28 +23,12 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--output-dir", default="results/train")
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--resume", action="store_true", help="Resume optimizer state and epoch from checkpoint.")
-    parser.add_argument("--resume-from", default=None, help="Checkpoint to resume from. Defaults to output-dir/checkpoints/latest.pt.")
     args = parser.parse_args()
 
     config = load_config(args.config)
     seed_everything(config.seed)
     device = resolve_device(config, args.device)
-    output_dir = Path(args.output_dir)
-    resume_from = None
-    if args.resume:
-        candidates = [
-            Path(args.resume_from) if args.resume_from else None,
-            Path(args.checkpoint) if args.checkpoint else None,
-            output_dir / "checkpoints" / "latest.pt",
-            output_dir / f"{args.stage}_last.pt",
-        ]
-        resume_from = next((path for path in candidates if path is not None and path.exists()), None)
-        if resume_from is None:
-            print(f"--resume was set, but no checkpoint was found under {output_dir}. Starting from scratch.")
-
-    model_checkpoint = None if resume_from is not None else args.checkpoint
-    model = build_model(config, checkpoint=model_checkpoint, device=device)
+    model = build_model(config, checkpoint=args.checkpoint, device=device)
     train_loader = build_loader(
         config,
         args.data_root,
@@ -78,12 +62,10 @@ def main() -> None:
         stage=args.stage,
         epochs=args.epochs or defaults["epochs"],
         lr=args.lr or defaults["lr"],
-        checkpoint_name="best_model.pt",
-        resume_from=resume_from,
+        checkpoint_name=f"{args.stage}_best.pt",
     )
     print(f"Training complete. Results written to {Path(args.output_dir).resolve()}")
-    if history:
-        print(f"Final epoch: {int(history[-1]['epoch'])}")
+    print(f"Final epoch: {history[-1] if history else {}}")
 
 
 if __name__ == "__main__":
