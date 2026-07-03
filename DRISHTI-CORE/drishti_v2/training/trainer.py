@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,16 @@ def _estimate_flops_per_step(model: nn.Module, batch_size: int) -> float:
     return 6.0 * trainable * batch_size
 
 
+def _score_from_metrics(metrics: dict[str, Any]) -> float:
+    if "val_map50" in metrics:
+        return float(metrics["val_map50"])
+    if "map50" in metrics:
+        return float(metrics["map50"])
+    if "train_loss" in metrics:
+        return -float(metrics["train_loss"])
+    return -math.inf
+
+
 class DRISHTITrainer:
     """Production training loop with comprehensive per-step metrics logging.
 
@@ -83,6 +94,8 @@ class DRISHTITrainer:
         self.loss_fn = loss_fn
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_dir = self.output_dir / "checkpoints"
+        self.metrics_dir = self.output_dir / "epoch_metrics"
         self.device = torch.device(device)
         self.step_logger = _setup_step_logger(self.output_dir)
 
@@ -104,7 +117,7 @@ class DRISHTITrainer:
         }
 
     def _collect_memory_metrics(self) -> dict[str, float]:
-        """Collect GPU memory stats (bytes → MB)."""
+        """Collect GPU memory stats (bytes -> MB)."""
         if self.device.type != "cuda":
             return {}
         return {
@@ -124,7 +137,7 @@ class DRISHTITrainer:
         weight_decay: float = 1e-4,
         checkpoint_name: str | None = None,
         resume_from: str | Path | None = None,
-    ) -> list[dict[str, float]]:
+    ) -> list[dict[str, Any]]:
         apply_training_stage(self.model, stage)
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         if not trainable:
@@ -133,20 +146,27 @@ class DRISHTITrainer:
         scheduler = make_scheduler(optimizer, epochs)
 
         start_epoch = 1
+        global_step = 0
         if resume_from:
             payload = torch.load(resume_from, map_location=self.device)
+            if "model" in payload:
+                self.model.load_state_dict(payload["model"])
+            else:
+                self.model.load_state_dict(payload)
             if "optimizer" in payload:
                 optimizer.load_state_dict(payload["optimizer"])
             if "scheduler" in payload:
                 scheduler.load_state_dict(payload["scheduler"])
             start_epoch = payload.get("epoch", 0) + 1
-            print(f"Resuming {stage} training from epoch {start_epoch}")
+            global_step = int(payload.get("global_step", 0))
+            print(f"Resuming {stage} training from {Path(resume_from)} at epoch {start_epoch}")
 
-        history: list[dict[str, float]] = []
-        best_score = -1.0
-        checkpoint_name = checkpoint_name or f"{stage}_best.pt"
+        history = self._load_existing_history(before_epoch=start_epoch)
+        best_checkpoint_name = checkpoint_name or "best_model.pt"
+        best_path = self.checkpoint_dir / best_checkpoint_name
+        latest_path = self.checkpoint_dir / "latest.pt"
+        best_score = self._load_best_score(best_path, history)
         total_params, trainable_params = _count_params(self.model)
-        global_step = 0
 
         # Log run metadata once
         run_meta = {
@@ -163,6 +183,20 @@ class DRISHTITrainer:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
+        if start_epoch > epochs:
+            summary = self._write_final_summary(
+                stage=stage,
+                epochs=epochs,
+                history=history,
+                best_score=best_score,
+                best_checkpoint=best_path,
+                latest_checkpoint=latest_path,
+            )
+            self._print_final_summary(summary, history[-1] if history else None)
+            return history
+
+        print(f"Training {stage}: epochs {start_epoch}-{epochs} | checkpoints: {self.checkpoint_dir}")
+
         for epoch in range(start_epoch, epochs + 1):
             self.model.train()
             apply_training_stage(self.model, stage)
@@ -178,7 +212,14 @@ class DRISHTITrainer:
             steps = 0
             epoch_start_time = time.perf_counter()
 
-            for batch in tqdm(self.train_loader, desc=f"{stage} epoch {epoch}/{epochs}", leave=False):
+            progress = tqdm(
+                self.train_loader,
+                desc=f"{stage} epoch {epoch}/{epochs}",
+                leave=True,
+                dynamic_ncols=True,
+                unit="batch",
+            )
+            for batch in progress:
                 step_start = time.perf_counter()
                 frames = batch["frames"].to(self.device)
                 batch_size = frames.shape[0]
@@ -205,7 +246,7 @@ class DRISHTITrainer:
                 # --- Throughput & MFU ---
                 throughput = batch_size / max(step_elapsed, 1e-8)
                 flops_per_step = _estimate_flops_per_step(self.model, batch_size)
-                # MFU = achieved_flops / peak_device_flops (RTX 4090 ≈ 82.6 TFLOPS FP32)
+                # MFU = achieved_flops / peak_device_flops (RTX 4090 approx. 82.6 TFLOPS FP32)
                 peak_flops = 82.6e12  # conservative FP32 estimate
                 sparse_mfu = (flops_per_step / max(step_elapsed, 1e-8)) / peak_flops
 
@@ -243,6 +284,7 @@ class DRISHTITrainer:
                 epoch_samples += batch_size
                 steps += 1
                 global_step += 1
+                progress.set_postfix(loss=f"{step_record['loss/total']:.4f}", lr=f"{step_record['lr']:.2e}")
 
             scheduler.step()
             epoch_elapsed = time.perf_counter() - epoch_start_time
@@ -272,36 +314,179 @@ class DRISHTITrainer:
                 score = -record["train_loss"]
 
             history.append(record)
-            self._append_csv(record)
+            self._write_history(history)
+            self._write_epoch_metrics(epoch, record)
 
             # Log epoch summary to step log as well
             epoch_record = dict(record)
             epoch_record["event"] = "epoch_end"
             self.step_logger.info(json.dumps(epoch_record, sort_keys=True))
 
-            print(json.dumps(record, indent=2, sort_keys=True))
-            if score > best_score:
+            if score > best_score or not best_path.exists():
                 best_score = score
-                self.save_checkpoint(self.output_dir / checkpoint_name, epoch, record, optimizer, scheduler)
-            self.save_checkpoint(self.output_dir / f"{stage}_last.pt", epoch, record, optimizer, scheduler)
+                self.save_checkpoint(best_path, epoch, record, optimizer, scheduler, stage=stage, global_step=global_step)
+            self.save_checkpoint(latest_path, epoch, record, optimizer, scheduler, stage=stage, global_step=global_step)
+            checkpointed_epoch_path = None
             if epoch % 10 == 0:
-                self.save_checkpoint(self.output_dir / f"{stage}_epoch_{epoch}.pt", epoch, record, optimizer, scheduler)
+                checkpointed_epoch_path = self.checkpoint_dir / f"epoch_{epoch:04d}.pt"
+                self.save_checkpoint(
+                    checkpointed_epoch_path,
+                    epoch,
+                    record,
+                    optimizer,
+                    scheduler,
+                    stage=stage,
+                    global_step=global_step,
+                )
+            self._write_checkpoint_manifest(
+                stage=stage,
+                latest_path=latest_path,
+                best_path=best_path,
+                epoch=epoch,
+                metrics=record,
+                best_score=best_score,
+                checkpointed_epoch_path=checkpointed_epoch_path,
+            )
+        summary = self._write_final_summary(
+            stage=stage,
+            epochs=epochs,
+            history=history,
+            best_score=best_score,
+            best_checkpoint=best_path,
+            latest_checkpoint=latest_path,
+        )
+        self._print_final_summary(summary, history[-1] if history else None)
         return history
 
-    def save_checkpoint(self, path: Path, epoch: int, metrics: dict[str, Any], optimizer=None, scheduler=None) -> None:
+    def save_checkpoint(
+        self,
+        path: Path,
+        epoch: int,
+        metrics: dict[str, Any],
+        optimizer=None,
+        scheduler=None,
+        stage: str | None = None,
+        global_step: int = 0,
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"epoch": epoch, "model": self.model.state_dict(), "metrics": metrics}
+        payload = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "stage": stage,
+            "model": self.model.state_dict(),
+            "metrics": metrics,
+        }
         if optimizer:
             payload["optimizer"] = optimizer.state_dict()
         if scheduler:
             payload["scheduler"] = scheduler.state_dict()
-        torch.save(payload, path)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
 
-    def _append_csv(self, record: dict[str, float]) -> None:
-        path = self.output_dir / "history.csv"
-        exists = path.exists()
-        with path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=sorted(record))
-            if not exists:
-                writer.writeheader()
-            writer.writerow(record)
+    def _load_existing_history(self, before_epoch: int) -> list[dict[str, Any]]:
+        path = self.output_dir / "history.json"
+        if not path.exists():
+            return []
+        records = json.loads(path.read_text(encoding="utf-8"))
+        return [record for record in records if int(record.get("epoch", 0)) < before_epoch]
+
+    def _load_best_score(self, best_path: Path, history: list[dict[str, Any]]) -> float:
+        if best_path.exists():
+            payload = torch.load(best_path, map_location="cpu")
+            if isinstance(payload, dict):
+                return _score_from_metrics(payload.get("metrics", {}))
+        if history:
+            return max(_score_from_metrics(record) for record in history)
+        return -math.inf
+
+    def _write_history(self, history: list[dict[str, Any]]) -> None:
+        json_path = self.output_dir / "history.json"
+        json_path.write_text(json.dumps(history, indent=2, sort_keys=True), encoding="utf-8")
+
+        csv_path = self.output_dir / "history.csv"
+        fieldnames = sorted({key for record in history for key in record})
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for record in history:
+                writer.writerow(record)
+
+    def _write_epoch_metrics(self, epoch: int, record: dict[str, Any]) -> None:
+        self.metrics_dir.mkdir(parents=True, exist_ok=True)
+        path = self.metrics_dir / f"epoch_{epoch:04d}.json"
+        path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _write_checkpoint_manifest(
+        self,
+        stage: str,
+        latest_path: Path,
+        best_path: Path,
+        epoch: int,
+        metrics: dict[str, Any],
+        best_score: float,
+        checkpointed_epoch_path: Path | None,
+    ) -> None:
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "stage": stage,
+            "latest_epoch": epoch,
+            "latest_checkpoint": str(latest_path),
+            "best_checkpoint": str(best_path),
+            "best_score": best_score,
+            "latest_metrics": metrics,
+            "saved_epoch_checkpoints": sorted(path.name for path in self.checkpoint_dir.glob("epoch_*.pt")),
+        }
+        if checkpointed_epoch_path is not None:
+            manifest["last_periodic_checkpoint"] = checkpointed_epoch_path.name
+        (self.checkpoint_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _write_final_summary(
+        self,
+        stage: str,
+        epochs: int,
+        history: list[dict[str, Any]],
+        best_score: float,
+        best_checkpoint: Path,
+        latest_checkpoint: Path,
+    ) -> dict[str, Any]:
+        latest = history[-1] if history else {}
+        best_record = max(history, key=_score_from_metrics) if history else {}
+        summary = {
+            "stage": stage,
+            "epochs_requested": epochs,
+            "epochs_completed": int(latest.get("epoch", 0)) if latest else 0,
+            "best_epoch": int(best_record.get("epoch", 0)) if best_record else 0,
+            "best_score": best_score,
+            "best_checkpoint": str(best_checkpoint),
+            "latest_checkpoint": str(latest_checkpoint),
+            "history_csv": str(self.output_dir / "history.csv"),
+            "history_json": str(self.output_dir / "history.json"),
+            "epoch_metrics_dir": str(self.metrics_dir),
+            "latest_metrics": latest,
+        }
+        (self.output_dir / "final_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        return summary
+
+    def _print_final_summary(self, summary: dict[str, Any], latest: dict[str, Any] | None) -> None:
+        print("\nTraining Summary")
+        print("=" * 72)
+        print(f"Stage: {summary['stage']} | epochs completed: {summary['epochs_completed']}/{summary['epochs_requested']}")
+        print(f"Best epoch: {summary['best_epoch']} | best score: {summary['best_score']:.6f}")
+        print(f"Latest checkpoint: {summary['latest_checkpoint']}")
+        print(f"Best checkpoint:   {summary['best_checkpoint']}")
+        if latest:
+            keys = [
+                "train_loss",
+                "val_map50",
+                "val_map75",
+                "val_precision",
+                "val_recall",
+                "val_f1",
+                "train_epoch_time_sec",
+            ]
+            for key in keys:
+                if key in latest:
+                    value = latest[key]
+                    print(f"{key}: {value:.6f}" if isinstance(value, float) else f"{key}: {value}")
+        print(f"Metrics: {summary['history_csv']} and {summary['history_json']}")

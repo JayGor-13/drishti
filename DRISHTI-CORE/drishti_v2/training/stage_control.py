@@ -18,6 +18,7 @@ def apply_training_stage(model: nn.Module, stage: str) -> None:
 
     if stage in {"stage1", "detector"}:
         _set_trainable(model.motion_cnn, True)
+        _set_trainable(model.encoder, True)
         _set_trainable(model.head, True)
     elif stage in {"stage2", "temporal"}:
         _set_trainable(model.temporal, True)

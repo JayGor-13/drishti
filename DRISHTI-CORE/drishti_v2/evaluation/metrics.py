@@ -34,12 +34,27 @@ def detection_metrics(
 ) -> dict[str, float]:
     totals = {0.5: [0, 0, 0], 0.75: [0, 0, 0]}
     fp_images = 0
+    total_predictions = 0
+    total_kept_predictions = 0
+    total_gt_boxes = 0
+    images_with_gt = 0
+    images_with_predictions = 0
+    score_sum = 0.0
+    max_score_sum = 0.0
     for pred, target in zip(predictions, targets):
         scores = pred["scores"]
+        total_predictions += int(scores.numel())
+        if scores.numel() > 0:
+            score_sum += float(scores.sum().item())
+            max_score_sum += float(scores.max().item())
         keep = scores >= score_threshold
         pred_boxes = pred["boxes"][keep]
         pred_scores = scores[keep]
         gt_boxes = target.get("boxes", torch.empty(0, 4, device=pred_boxes.device)).to(pred_boxes.device)
+        total_kept_predictions += int(pred_boxes.shape[0])
+        total_gt_boxes += int(gt_boxes.shape[0])
+        images_with_gt += int(gt_boxes.shape[0] > 0)
+        images_with_predictions += int(pred_boxes.shape[0] > 0)
         for threshold in totals:
             tp, fp, fn = match_detections(pred_boxes, pred_scores, gt_boxes, threshold)
             totals[threshold][0] += tp
@@ -62,4 +77,13 @@ def detection_metrics(
         "map50": map50,
         "map75": precision75 * recall75,
         "false_positives_per_image": fp50 / max(1, len(predictions)),
+        "score_threshold": score_threshold,
+        "gt_boxes": float(total_gt_boxes),
+        "images": float(len(predictions)),
+        "images_with_gt": float(images_with_gt),
+        "images_with_predictions": float(images_with_predictions),
+        "raw_predictions_per_image": total_predictions / max(1, len(predictions)),
+        "kept_predictions_per_image": total_kept_predictions / max(1, len(predictions)),
+        "mean_score": score_sum / max(1, total_predictions),
+        "mean_top_score": max_score_sum / max(1, len(predictions)),
     }
