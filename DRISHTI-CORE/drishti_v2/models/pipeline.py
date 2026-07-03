@@ -10,7 +10,7 @@ from drishti_v2.models.crop_encoder import CropEncoder
 from drishti_v2.models.crop_proposal import CropProposalEngine
 from drishti_v2.models.detection_head import DetectionHead
 from drishti_v2.models.ldmi import LocalDifferentialMotion
-from drishti_v2.models.moe import SparseMoE
+from drishti_v2.models.moe import MoEDiagnostics, SparseMoE
 from drishti_v2.models.motion_cnn import MotionCNN
 from drishti_v2.models.temporal_fusion import CausalTemporalFusion
 
@@ -28,6 +28,7 @@ class PipelineOutput:
     crop_boxes: Tensor
     boxes: Tensor
     balance_loss: Tensor
+    moe_diagnostics: MoEDiagnostics | None = None
 
 
 class DRISHTIPipeline(nn.Module):
@@ -115,7 +116,7 @@ class DRISHTIPipeline(nn.Module):
         assert last is not None
         sequence = torch.stack(features[-self.config.temporal_window :], dim=1)
         fused = self.temporal(sequence)
-        moe_features, balance_loss = self.moe(fused)
+        moe_features, moe_diag = self.moe(fused)
         logits, crop_boxes = self.head(moe_features)
         heatmap, centers, scores, sources, encoded = last
         global_boxes = self._boxes_to_global(crop_boxes, centers, (height, width))
@@ -130,7 +131,8 @@ class DRISHTIPipeline(nn.Module):
             objectness_logits=logits,
             crop_boxes=crop_boxes,
             boxes=global_boxes,
-            balance_loss=balance_loss,
+            balance_loss=moe_diag.balance_loss,
+            moe_diagnostics=moe_diag,
         )
 
     @torch.no_grad()
@@ -159,10 +161,13 @@ class DRISHTIPipeline(nn.Module):
             seq = [seq[0]] * (self.config.temporal_window - len(seq)) + seq
         sequence = torch.stack(seq[-self.config.temporal_window :], dim=1)
         fused = self.temporal(sequence)
-        moe_features, balance_loss = self.moe(fused)
+        moe_features, moe_diag = self.moe(fused)
         logits, crop_boxes = self.head(moe_features)
         global_boxes = self._boxes_to_global(crop_boxes, centers, frame.shape[-2:])
-        return PipelineOutput(heatmap, centers, scores, sources, encoded, fused, moe_features, logits, crop_boxes, global_boxes, balance_loss)
+        return PipelineOutput(
+            heatmap, centers, scores, sources, encoded, fused, moe_features,
+            logits, crop_boxes, global_boxes, moe_diag.balance_loss, moe_diag,
+        )
 
     def reset_stream(self) -> None:
         self._stream_buffer.clear()
