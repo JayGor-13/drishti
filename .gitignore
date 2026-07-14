@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+checkpoints/
+logs/
+results/
+smokerun.py
+.venv/
+venv/
+*.egg-info/
+20190926_200510_1_6-20260713T120642Z-2-001/
