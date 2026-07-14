@@ -5,16 +5,27 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+_grid_cache = {}
+
 def soft_argmax2d(heatmap: Tensor, temperature: float = 0.1) -> Tensor:
     """Return differentiable normalized (x, y) peak locations for [B, 1, H, W]."""
 
     batch, _, height, width = heatmap.shape
+    device = heatmap.device
+    dtype = heatmap.dtype
+
+    grid_key = (height, width, str(device), str(dtype))
+    if grid_key not in _grid_cache:
+        ys = torch.linspace(0.0, 1.0, height, device=device, dtype=dtype)
+        xs = torch.linspace(0.0, 1.0, width, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        _grid_cache[grid_key] = (grid_x.flatten().view(1, -1), grid_y.flatten().view(1, -1))
+
+    grid_x_flat, grid_y_flat = _grid_cache[grid_key]
+
     weights = F.softmax(heatmap.flatten(1) / max(temperature, 1e-6), dim=-1)
-    ys = torch.linspace(0.0, 1.0, height, device=heatmap.device, dtype=heatmap.dtype)
-    xs = torch.linspace(0.0, 1.0, width, device=heatmap.device, dtype=heatmap.dtype)
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-    x = (weights * grid_x.flatten().view(1, -1)).sum(dim=1)
-    y = (weights * grid_y.flatten().view(1, -1)).sum(dim=1)
+    x = (weights * grid_x_flat).sum(dim=1)
+    y = (weights * grid_y_flat).sum(dim=1)
     return torch.stack([x, y], dim=1).view(batch, 2)
 
 
@@ -37,10 +48,10 @@ def motion_displacement_loss(
         for batch_idx in range(batch):
             boxes = targets[batch_idx][time_idx].get("boxes", torch.empty(0, 4))
             if boxes.numel() == 0:
-                centers.append(torch.zeros(2, device=device, dtype=dtype))
+                centers.append(torch.zeros(2, dtype=dtype))
             else:
-                centers.append(boxes[0, :2].to(device=device, dtype=dtype))
-        gt_centers.append(torch.stack(centers, dim=0))
+                centers.append(boxes[0, :2].to(dtype=dtype))
+        gt_centers.append(torch.stack(centers, dim=0).to(device))
 
     pred_centers = [soft_argmax2d(heatmap, temperature) for heatmap in heatmaps]
     total = heatmaps[0].sum() * 0.0

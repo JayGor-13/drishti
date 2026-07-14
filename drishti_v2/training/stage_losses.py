@@ -19,38 +19,75 @@ def last_targets(targets: list) -> list[dict]:
 
 
 def make_gt_heatmaps(targets: list[dict], heatmap_size: tuple[int, int], device: torch.device) -> Tensor:
-    heatmaps = []
+    batch = len(targets)
+    height, width = heatmap_size
+    
+    heatmaps = torch.zeros(batch, 1, height, width, device=device)
+    
+    centers = []
+    valid_mask = []
     for target in targets:
-        boxes = target.get("boxes", torch.empty(0, 4)).to(device)
-        heatmaps.append(MotionCNN.make_gt_heatmap(boxes, heatmap_size))
-    return torch.stack(heatmaps, dim=0)
+        boxes = target.get("boxes", torch.empty(0, 4))
+        if boxes.numel() > 0:
+            centers.append(boxes[0, :2])
+            valid_mask.append(True)
+        else:
+            centers.append(torch.zeros(2))
+            valid_mask.append(False)
+            
+    valid_mask = torch.tensor(valid_mask, device=device, dtype=torch.bool)
+    if not valid_mask.any():
+        return heatmaps
+        
+    centers = torch.stack(centers, dim=0).to(device)
+    
+    y = torch.arange(height, device=device, dtype=centers.dtype).view(1, 1, height, 1)
+    x = torch.arange(width, device=device, dtype=centers.dtype).view(1, 1, 1, width)
+    
+    centers_x = (centers[:, 0].clamp(0, 1) * (width - 1)).view(batch, 1, 1, 1)
+    centers_y = (centers[:, 1].clamp(0, 1) * (height - 1)).view(batch, 1, 1, 1)
+    
+    sigma = 2.0
+    gaussian = torch.exp(-((x - centers_x) ** 2 + (y - centers_y) ** 2) / (2.0 * sigma**2))
+    
+    heatmaps = torch.where(valid_mask.view(batch, 1, 1, 1), gaussian, heatmaps)
+    return heatmaps.clamp(0.0, 1.0)
 
 
 def assign_crops(output: PipelineOutput, targets: list[dict]) -> tuple[Tensor, Tensor]:
-    """Assign each GT box to the nearest crop center."""
-
+    """Assign each GT box to the nearest crop center, computed on CPU to avoid GPU-CPU sync stalls."""
+    device = output.proposal_centers.device
     batch, num_crops, _ = output.proposal_centers.shape
-    labels = output.objectness_logits.new_zeros(batch, num_crops, 1)
-    box_targets = output.crop_boxes.detach().new_zeros(batch, num_crops, 4)
+    
+    centers_cpu = output.proposal_centers.detach().cpu()
+    crop_boxes_cpu = output.crop_boxes.detach().cpu()
+    boxes_cpu = output.boxes.detach().cpu()
+    
+    labels = torch.zeros(batch, num_crops, 1, dtype=output.objectness_logits.dtype)
+    box_targets = torch.zeros(batch, num_crops, 4, dtype=output.crop_boxes.dtype)
 
     for batch_idx, target in enumerate(targets):
-        boxes = target.get("boxes", torch.empty(0, 4)).to(output.proposal_centers.device)
+        boxes = target.get("boxes", torch.empty(0, 4)).detach().cpu()
         if boxes.numel() == 0:
             continue
-        distances = torch.cdist(output.proposal_centers[batch_idx], boxes[:, :2])
-        for crop_idx in distances.argmin(dim=0).unique():
-            gt_idx = distances[crop_idx].argmin()
+        distances = torch.cdist(centers_cpu[batch_idx], boxes[:, :2])
+        argmin_indices = distances.argmin(dim=0)
+        unique_crops = argmin_indices.unique()
+        
+        for crop_idx in unique_crops:
+            crop_idx_item = crop_idx.item()
+            gt_idx = distances[crop_idx_item].argmin().item()
             gt = boxes[gt_idx]
-            labels[batch_idx, crop_idx, 0] = 1.0
+            labels[batch_idx, crop_idx_item, 0] = 1.0
 
-            global_size = output.boxes[batch_idx, crop_idx, 2:].clamp_min(1e-6)
-            crop_size = output.crop_boxes[batch_idx, crop_idx, 2:].clamp_min(1e-6)
+            global_size = boxes_cpu[batch_idx, crop_idx_item, 2:].clamp_min(1e-6)
+            crop_size = crop_boxes_cpu[batch_idx, crop_idx_item, 2:].clamp_min(1e-6)
             crop_scale = global_size / crop_size
-            rel_xy = (gt[:2] - output.proposal_centers[batch_idx, crop_idx]) / crop_scale + 0.5
+            rel_xy = (gt[:2] - centers_cpu[batch_idx, crop_idx_item]) / crop_scale + 0.5
             rel_wh = gt[2:] / crop_scale
-            box_targets[batch_idx, crop_idx] = torch.cat([rel_xy, rel_wh]).clamp(0.0, 1.0)
+            box_targets[batch_idx, crop_idx_item] = torch.cat([rel_xy, rel_wh]).clamp(0.0, 1.0)
 
-    return labels, box_targets
+    return labels.to(device), box_targets.to(device)
 
 
 class DetectionLossMixin:

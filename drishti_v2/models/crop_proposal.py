@@ -83,11 +83,17 @@ class CropProposalEngine(nn.Module):
         dtype = frame.dtype
         device = frame.device
 
-        offsets = torch.arange(crop_size, device=device, dtype=dtype) - (crop_size - 1) / 2.0
-        x_offsets = 2.0 * offsets / max(width - 1, 1)
-        y_offsets = 2.0 * offsets / max(height - 1, 1)
-        grid_y, grid_x = torch.meshgrid(y_offsets, x_offsets, indexing="ij")
-        offset_grid = torch.stack([grid_x, grid_y], dim=-1).view(1, 1, crop_size, crop_size, 2)
+        grid_key = (height, width, crop_size, str(device), str(dtype))
+        if not hasattr(self, "_offset_grid_cache"):
+            self._offset_grid_cache = {}
+        if grid_key not in self._offset_grid_cache:
+            offsets = torch.arange(crop_size, device=device, dtype=dtype) - (crop_size - 1) / 2.0
+            x_offsets = 2.0 * offsets / max(width - 1, 1)
+            y_offsets = 2.0 * offsets / max(height - 1, 1)
+            grid_y, grid_x = torch.meshgrid(y_offsets, x_offsets, indexing="ij")
+            offset_grid = torch.stack([grid_x, grid_y], dim=-1).view(1, 1, crop_size, crop_size, 2)
+            self._offset_grid_cache[grid_key] = offset_grid
+        offset_grid = self._offset_grid_cache[grid_key]
 
         base = centers.clamp(0, 1).mul(2.0).sub(1.0).view(batch, num_crops, 1, 1, 2)
         grid = (base + offset_grid).reshape(batch * num_crops, crop_size, crop_size, 2)
