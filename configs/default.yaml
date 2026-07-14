@@ -1,0 +1,68 @@
+image_channels: 3
+image_height: 448
+image_width: 448
+ldmi_scales: [7, 15, 31, 63]
+use_ldmi: true
+motion_cnn_channels: [32, 64, 64]
+use_motion_gate: true
+motion_gate_hidden: 16
+motion_gate_threshold: 0.5
+motion_gate_active_threshold: 0.5
+num_crops: 8
+crop_size: 64
+dense_grid_size: 4
+border_width_frac: 0.07
+scan_period: 4
+use_edge_crops: true
+use_grid_crops: true
+use_motion_crops: true
+use_guided_crops: true
+encoder_feature_dim: 256
+encoder_frozen: true
+temporal_window: 5
+temporal_heads: 4
+temporal_layers: 2
+temporal_ffn_dim: 512
+temporal_dropout: 0.1
+num_experts: 8
+top_k: 2
+expert_ffn_dim: 512
+moe_dropout: 0.1
+moe_balance_weight: 0.01
+router_z_loss_weight: 0.001
+dense_moe: false
+head_hidden_dim: 256
+objectness_threshold: 0.3
+focal_gamma: 2.0
+focal_alpha: 0.25
+heatmap_focal_alpha: 2.0
+heatmap_focal_beta: 4.0
+w_motion_displacement: 0.5
+w_gate_sparsity: 0.01
+w_temporal_consistency: 0.3
+w_trajectory_smoothness: 0.1
+sigma_spatial_consist: 0.1
+tracker_dist_threshold: 0.15
+tracker_max_coast: 15
+tracker_birth_threshold: 0.3
+dataset_name: anti_uav
+data_root:
+frames_root:
+modality: visible
+box_format: xywh
+clip_stride: 4
+frame_stride: 1
+eval_split: val
+output_dir: results
+checkpoint:
+smoke_sequence_dir:
+smoke_max_frames: 24
+smoke_train_steps: 2
+smoke_lr: 0.0001
+smoke_output_video: results/smokerun/bounding_boxes.mp4
+visualization_threshold: 0.3
+train_batch_size: 32
+eval_batch_size: 32
+num_workers: 12
+seed: 42
+device: auto
