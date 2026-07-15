@@ -96,10 +96,18 @@ class CropProposalEngine(nn.Module):
         offset_grid = self._offset_grid_cache[grid_key]
 
         base = centers.clamp(0, 1).mul(2.0).sub(1.0).view(batch, num_crops, 1, 1, 2)
-        grid = (base + offset_grid).reshape(batch * num_crops, crop_size, crop_size, 2)
-        expanded = frame[:, None].expand(batch, num_crops, channels, height, width)
-        expanded = expanded.reshape(batch * num_crops, channels, height, width)
-        return F.grid_sample(expanded, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        
+        # Optimize memory usage by preventing full frame replication
+        # We reshape grid to (batch, num_crops * crop_size, crop_size, 2) so grid_sample can process 
+        # the entire batch without needing to replicate the high-resolution frame.
+        grid = (base + offset_grid).reshape(batch, num_crops * crop_size, crop_size, 2)
+        
+        # sampled shape will be (batch, channels, num_crops * crop_size, crop_size)
+        sampled = F.grid_sample(frame, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        
+        # Reshape and transpose to final required output shape: (batch * num_crops, channels, crop_size, crop_size)
+        sampled = sampled.view(batch, channels, num_crops, crop_size, crop_size)
+        return sampled.transpose(1, 2).reshape(batch * num_crops, channels, crop_size, crop_size)
 
     def _append(
         self,
