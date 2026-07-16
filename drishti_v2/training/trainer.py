@@ -46,6 +46,7 @@ class DRISHTITrainer:
         lr: float,
         weight_decay: float = 1e-4,
         checkpoint_name: str | None = None,
+        resume_checkpoint: str | None = None,
     ) -> list[dict[str, float]]:
         apply_training_stage(self.model, stage)
         trainable = [p for p in self.model.parameters() if p.requires_grad]
@@ -55,9 +56,21 @@ class DRISHTITrainer:
         scheduler = make_scheduler(optimizer, epochs)
         history: list[dict[str, float]] = []
         best_score = -1.0
-        checkpoint_name = checkpoint_name or f"{stage}_best.pt"
+        
+        start_epoch = 1
+        if resume_checkpoint:
+            payload = torch.load(resume_checkpoint, map_location=self.device)
+            if isinstance(payload, dict):
+                start_epoch = payload.get("epoch", 0) + 1
+                if "optimizer" in payload:
+                    optimizer.load_state_dict(payload["optimizer"])
+                if "scheduler" in payload:
+                    scheduler.load_state_dict(payload["scheduler"])
 
-        for epoch in range(1, epochs + 1):
+        checkpoints_dir = self.output_dir / "checkpoints"
+        checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+        for epoch in range(start_epoch, epochs + 1):
             self.model.train()
             apply_training_stage(self.model, stage)
             loss_keys = [
@@ -148,13 +161,22 @@ class DRISHTITrainer:
             print(json.dumps(record, indent=2, sort_keys=True))
             if score > best_score:
                 best_score = score
-                self.save_checkpoint(self.output_dir / checkpoint_name, epoch, record)
-            self.save_checkpoint(self.output_dir / f"{stage}_last.pt", epoch, record)
+                self.save_checkpoint(checkpoints_dir / f"{stage}_best.pt", epoch, record, optimizer, scheduler)
+            
+            self.save_checkpoint(checkpoints_dir / f"{stage}_latest.pt", epoch, record, optimizer, scheduler)
+            
+            if epoch == 1 or epoch % 10 == 0:
+                self.save_checkpoint(checkpoints_dir / f"{stage}_epoch_{epoch}.pt", epoch, record, optimizer, scheduler)
         return history
 
-    def save_checkpoint(self, path: Path, epoch: int, metrics: dict[str, Any]) -> None:
+    def save_checkpoint(self, path: Path, epoch: int, metrics: dict[str, Any], optimizer=None, scheduler=None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"epoch": epoch, "model": self.model.state_dict(), "metrics": metrics}, path)
+        payload = {"epoch": epoch, "model": self.model.state_dict(), "metrics": metrics}
+        if optimizer is not None:
+            payload["optimizer"] = optimizer.state_dict()
+        if scheduler is not None:
+            payload["scheduler"] = scheduler.state_dict()
+        torch.save(payload, path)
 
     def _append_csv(self, record: dict[str, float]) -> None:
         path = self.output_dir / "history.csv"

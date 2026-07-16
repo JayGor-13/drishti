@@ -76,7 +76,15 @@ def main() -> None:
             device=device
         )
 
-        trainer.fit(stage=stage, epochs=current_epochs, lr=config.smoke_lr)
+        is_first_stage_in_loop = (stage == stages[0])
+        resume_path = args.resume if (args.resume and is_first_stage_in_loop) else None
+        
+        trainer.fit(
+            stage=stage, 
+            epochs=current_epochs, 
+            lr=config.smoke_lr,
+            resume_checkpoint=resume_path
+        )
 
     print("\nAll training stages complete!")
 
