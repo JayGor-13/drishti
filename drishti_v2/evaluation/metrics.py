@@ -128,6 +128,48 @@ def detection_flicker_rate(
     return {"detection_flicker_rate": float(changes / max(len(states) - 1, 1))}
 
 
+def antiuav_tracking_accuracy(
+    predictions: list[dict[str, Tensor]],
+    targets: list[dict[str, Tensor]],
+    score_threshold: float = 0.3,
+) -> dict[str, float]:
+    """Computes the official AntiUAV dataset tracking accuracy metric."""
+    
+    if not predictions or not targets:
+        return {"antiuav_tracking_accuracy": 0.0}
+        
+    total_frames = len(predictions)
+    t_star = 0
+    term1_sum = 0.0
+    fn_sum = 0.0
+    
+    for pred, target in zip(predictions, targets):
+        gt_boxes = target.get("boxes", torch.empty(0, 4))
+        gt_visible = gt_boxes.numel() > 0
+        
+        pred_box, pred_score = _top_box(pred)
+        detected = pred_score is not None and float(pred_score) >= score_threshold
+        
+        # p_t = 1 when predicted box is empty, 0 otherwise
+        p_t = 1.0 if not detected else 0.0
+        
+        iou_t = 0.0
+        if gt_visible and detected:
+            iou_t = float(box_iou(pred_box.view(1, 4), gt_boxes[0].view(1, 4))[0, 0].item())
+            
+        if gt_visible:
+            term1_sum += iou_t
+            t_star += 1
+            fn_sum += p_t
+        else:
+            term1_sum += p_t
+            
+    term1 = term1_sum / max(total_frames, 1)
+    term2 = 0.2 * ((fn_sum / max(t_star, 1)) ** 0.3) if t_star > 0 else 0.0
+    
+    return {"antiuav_tracking_accuracy": float(term1 - term2)}
+
+
 def temporal_detection_metrics(
     predictions: list[dict[str, Tensor]],
     targets: list[dict[str, Tensor]],
@@ -139,6 +181,7 @@ def temporal_detection_metrics(
     metrics.update(temporal_iou(predictions))
     metrics.update(trajectory_smoothness(predictions))
     metrics.update(detection_flicker_rate(predictions, targets, score_threshold))
+    metrics.update(antiuav_tracking_accuracy(predictions, targets, score_threshold))
     return metrics
 
 
