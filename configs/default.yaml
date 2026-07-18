@@ -54,7 +54,7 @@ clip_stride: 4
 frame_stride: 1
 eval_split: val
 output_dir: results
-checkpoint:
+checkpoint: "results/full_training/stage4/stage4_best.pt"
 smoke_sequence_dir:
 smoke_max_frames: 24
 smoke_train_steps: 2
