@@ -1,0 +1,58 @@
+# Build from the code directory: docker build -t drishti-small-objects -f dgx/Dockerfile.small_objects .
+ARG YOLOFT_COMMIT=9e51ac319baf0d3793694e770e049585648bae42
+
+# Optional official reference. CUDA extensions require a different PyTorch runtime.
+FROM pytorch/pytorch:2.4.0-cuda11.8-cudnn9-devel AS yoloft
+ARG YOLOFT_COMMIT
+ARG TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+ENV CUDA_HOME=/usr/local/cuda CC=gcc CXX=g++ MAX_JOBS=4 \
+    PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 YOLO_AUTOINSTALL=false \
+    YOLO_CONFIG_DIR=/tmp/yolo MPLCONFIGDIR=/tmp/mpl MPLBACKEND=Agg HOME=/tmp
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates git gcc g++ libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone https://github.com/gjhhust/YOLOFT.git /opt/YOLOFT \
+    && git -C /opt/YOLOFT checkout --detach "$YOLOFT_COMMIT"
+WORKDIR /opt/YOLOFT
+# Docker build has the CUDA toolkit but no GPU. The architectures are explicit above.
+RUN sed -i 's/torch.cuda.is_available() and CUDA_HOME is not None/CUDA_HOME is not None/' \
+        ultralytics/nn/modules/ops_dcnv3/setup.py
+RUN pip install --no-cache-dir torch==2.4.0+cu118 torchvision==0.19.0+cu118 \
+        --index-url https://download.pytorch.org/whl/cu118 \
+    && pip install --no-cache-dir -r requirements.txt -c config/environment/cu118.txt \
+    && pip install --no-build-isolation --no-deps ./ultralytics/nn/modules/ops_dcnv3 \
+    && pip install --no-build-isolation --no-deps ./ultralytics/nn/modules/alt_cuda_corr_sparse \
+    && python -c 'import torch; import DCNv3, alt_cuda_sparse_corr'
+COPY dgx/run_yoloft_xsvid.sh /opt/run_yoloft_xsvid.sh
+ENTRYPOINT ["bash", "/opt/run_yoloft_xsvid.sh"]
+
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime AS benchmark
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates git libgl1 libglib2.0-0 octave octave-image \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir "numpy==1.26.4" "opencv-python==4.11.0.86" \
+        "ultralytics==8.3.228" "pycocotools==2.0.10" "gdown==5.2.0" pillow pyyaml
+
+ARG YOLOFT_COMMIT
+RUN git clone https://github.com/gjhhust/YOLOFT.git /opt/YOLOFT \
+    && git -C /opt/YOLOFT checkout --detach "$YOLOFT_COMMIT" \
+    && git clone https://github.com/VisDrone/VisDrone2018-VID-toolkit.git /opt/VisDrone-VID \
+    && git -C /opt/VisDrone-VID checkout --detach b5712fbf787a96dea4343475bcea2c849328215b \
+    && git -C /opt/VisDrone-VID rev-parse HEAD > /opt/VisDrone-VID/REVISION \
+    && git clone https://github.com/jwwangchn/cocoapi-aitod.git /opt/cocoapi-aitod \
+    && git -C /opt/cocoapi-aitod checkout --detach 44a230ae5197cb89bf9e5e62f313cac3ad30c7af \
+    && mkdir /opt/aitod \
+    && sed 's/dtype=np\.float)/dtype=float)/g' /opt/cocoapi-aitod/aitodpycocotools/aitodpycocotools/cocoeval.py > /opt/aitod/cocoeval.py
+
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 MPLBACKEND=Agg MPLCONFIGDIR=/tmp/mpl \
+    YOLO_CONFIG_DIR=/tmp/yolo YOLO_AUTOINSTALL=false HOME=/tmp \
+    OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+
+WORKDIR /opt/drishti
+COPY drishti_v2 drishti_v2
+COPY scripts/baselines/yolo_antiuav.py scripts/baselines/small_object_*.py scripts/baselines/
+COPY dgx/score_visdrone_vid.m dgx/
+WORKDIR /workspace
+ENTRYPOINT ["python", "/opt/drishti/scripts/baselines/small_object_benchmark.py"]

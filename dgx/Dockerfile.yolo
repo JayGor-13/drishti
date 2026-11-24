@@ -1,0 +1,13 @@
+# Image for the YOLO11 baseline (Ultralytics). Same base as the DRISHTI image, plus Ultralytics.
+# Build (from the code folder on the DGX):  docker build -t drishti-yolo:latest -f dgx/Dockerfile.yolo dgx
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir "ultralytics>=8.3.0,<8.4" numpy pillow pyyaml tqdm matplotlib psutil pytest
+
+ENV PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg \
+    MPLCONFIGDIR=/tmp/mpl \
+    YOLO_CONFIG_DIR=/tmp/yolo \
+    HOME=/tmp
+WORKDIR /workspace/code

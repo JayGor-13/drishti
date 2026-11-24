@@ -1,0 +1,23 @@
+# Image for the MMDetection baselines (DINO, Deformable-DETR).
+# mmcv is COMPILED here for the DGX GPUs: the prebuilt wheel has no kernels for them
+# ("CUDA error: no kernel image is available", 20 Oct). Covers A100 (8.0), A10/3090 (8.6), L40 (8.9), H100 (9.0).
+# The build takes about 20-40 minutes once.
+# Build:  docker build -t drishti-mmdet:latest -f dgx/Dockerfile.mmdet dgx
+FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ninja-build libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
+    FORCE_CUDA=1 \
+    MMCV_WITH_OPS=1 \
+    MAX_JOBS=16
+RUN pip install --no-cache-dir "numpy<2" "mmengine==0.10.4" pyyaml tqdm pillow scipy pycocotools psutil && \
+    pip install --no-cache-dir --no-build-isolation --no-binary mmcv "mmcv==2.1.0" && \
+    pip install --no-cache-dir "mmdet==3.3.0" fairscale && \
+    python -c "import mmcv, mmdet; from mmcv.ops import MultiScaleDeformableAttention, sigmoid_focal_loss; print('mmcv', mmcv.__version__, 'mmdet', mmdet.__version__, 'ops ok')"
+
+ENV PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg \
+    MPLCONFIGDIR=/tmp/mpl \
+    HOME=/tmp \
+    MKL_THREADING_LAYER=GNU
+WORKDIR /workspace/code

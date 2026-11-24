@@ -1,0 +1,37 @@
+image_channels: 3
+image_height: 448
+image_width: 448
+ldmi_scales: [15, 31]
+use_ldmi: false
+motion_cnn_channels: [32, 64, 64]
+num_crops: 8
+crop_size: 64
+border_width_frac: 0.07
+scan_period: 4
+use_edge_crops: true
+use_grid_crops: true
+use_motion_crops: true
+use_guided_crops: true
+encoder_feature_dim: 256
+encoder_frozen: true
+temporal_window: 5
+temporal_heads: 4
+temporal_layers: 2
+temporal_ffn_dim: 512
+temporal_dropout: 0.1
+num_experts: 8
+top_k: 2
+expert_ffn_dim: 512
+moe_dropout: 0.1
+moe_balance_weight: 0.01
+dense_moe: false
+head_hidden_dim: 256
+objectness_threshold: 0.3
+tracker_dist_threshold: 0.15
+tracker_max_coast: 15
+tracker_birth_threshold: 0.3
+train_batch_size: 8
+eval_batch_size: 8
+num_workers: 4
+seed: 42
+device: auto

@@ -1,0 +1,21 @@
+# Image for the multi-frame infrared small-target baselines CHAL (CVPR'26) and SSTNet (TGRS'24), same lab (UESTC-nnLab).
+# Both repositories are cloned into the image (/opt/CHAL, /opt/SSTNet). CHAL asks for torch 2.0, but the DGX has
+# H200 GPUs (sm_90), which torch 2.0 + cu117 cannot run on (20 Oct), so torch 2.1 + cu121 is used.
+# The public CHAL repository misses nets/module/CBAM.py; chal_cbam.py restores it from parts in the repository.
+# Build:  docker build -t drishti-istd:latest -f dgx/Dockerfile.istd dgx
+FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends git libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir "numpy==1.24.4" "scipy==1.10.1" "matplotlib==3.7.5" opencv-python-headless pycocotools \
+        "timm==0.9.16" tqdm pillow tensorboard thop einops pyyaml psutil
+RUN git clone --depth 1 https://github.com/UESTC-nnLab/CHAL.git /opt/CHAL && \
+    git clone --depth 1 https://github.com/UESTC-nnLab/SSTNet.git /opt/SSTNet
+COPY chal_cbam.py /opt/CHAL/nets/module/CBAM.py
+RUN touch /opt/CHAL/nets/module/__init__.py && chmod -R a+rwX /opt/CHAL /opt/SSTNet
+
+ENV PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg \
+    MPLCONFIGDIR=/tmp/mpl \
+    HOME=/tmp \
+    MKL_THREADING_LAYER=GNU
+WORKDIR /workspace/code

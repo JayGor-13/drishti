@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+
+_grid_cache = {}
+
+def soft_argmax2d(heatmap: Tensor, temperature: float = 0.1) -> Tensor:
+    """Return differentiable normalized (x, y) peak locations for [B, 1, H, W]."""
+
+    batch, _, height, width = heatmap.shape
+    device = heatmap.device
+    dtype = heatmap.dtype
+
+    grid_key = (height, width, str(device), str(dtype))
+    if grid_key not in _grid_cache:
+        ys = torch.linspace(0.0, 1.0, height, device=device, dtype=dtype)
+        xs = torch.linspace(0.0, 1.0, width, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        _grid_cache[grid_key] = (grid_x.flatten().view(1, -1), grid_y.flatten().view(1, -1))
+
+    grid_x_flat, grid_y_flat = _grid_cache[grid_key]
+
+    weights = F.softmax(heatmap.flatten(1) / max(temperature, 1e-6), dim=-1)
+    x = (weights * grid_x_flat).sum(dim=1)
+    y = (weights * grid_y_flat).sum(dim=1)
+    return torch.stack([x, y], dim=1).view(batch, 2)
+
+
+def motion_displacement_loss(
+    heatmaps: list[Tensor],
+    targets: list[list[dict]],
+    temperature: float = 0.1,
+) -> Tensor:
+    """Match heatmap peak displacement to Anti-UAV box-center displacement."""
+
+    if len(heatmaps) < 2:
+        return heatmaps[0].sum() * 0.0
+
+    batch = heatmaps[0].shape[0]
+    device = heatmaps[0].device
+    dtype = heatmaps[0].dtype
+    gt_centers = []
+    valid_centers = []
+    for time_idx in range(len(heatmaps)):
+        centers = []
+        valid = []
+        for batch_idx in range(batch):
+            clip = targets[batch_idx]
+            target = clip[min(time_idx, len(clip) - 1)] if clip else {"boxes": torch.empty(0, 4)}
+            boxes = target.get("boxes", torch.empty(0, 4))
+            if boxes.numel() == 0:
+                centers.append(torch.zeros(2, dtype=dtype))
+                valid.append(False)
+            else:
+                # Dataset targets are normalized cxcywh, so [:2] is the true center.
+                centers.append(boxes[0, :2].to(dtype=dtype))
+                valid.append(True)
+        gt_centers.append(torch.stack(centers, dim=0).to(device))
+        valid_centers.append(torch.tensor(valid, dtype=torch.bool, device=device))
+
+    pred_centers = [soft_argmax2d(heatmap, temperature) for heatmap in heatmaps]
+    total = heatmaps[0].sum() * 0.0
+    valid_pairs = 0
+    for time_idx in range(1, len(heatmaps)):
+        valid = valid_centers[time_idx - 1] & valid_centers[time_idx]
+        if not valid.any():
+            continue
+        pred_delta = pred_centers[time_idx] - pred_centers[time_idx - 1]
+        gt_delta = gt_centers[time_idx] - gt_centers[time_idx - 1]
+        total = total + F.mse_loss(pred_delta[valid], gt_delta[valid])
+        valid_pairs += 1
+    return total / float(max(valid_pairs, 1))
